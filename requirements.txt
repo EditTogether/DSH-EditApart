@@ -1,0 +1,7 @@
+# Python deps for the EditApart engines.
+# The engine (bin/edit_apart_core.py, bin/photo_core.py) runs on Python 3.9+.
+# scenedetect is the only hard runtime requirement; numpy is pulled in by it.
+# OpenCV 5.x requires numpy>=2; if your installed opencv is older, pin
+# numpy<2 to avoid the "KeyError: 'rad2deg'" import crash (see setup.sh).
+scenedetect>=0.7.0,<0.8
+numpy>=1.26,<2.0

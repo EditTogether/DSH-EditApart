@@ -1,0 +1,12 @@
+# Python bytecode caches (engines + standalone scripts)
+__pycache__/
+*.py[cod]
+
+# Machine-local path overrides — do NOT commit. `env.sh` is generated (from
+# env.sh.example) by setup.sh or by hand; `.dshenv` is the plugin-readable form.
+env.sh
+.dshenv
+
+# Output artifacts from reference runs
+*.mp4
+*.png

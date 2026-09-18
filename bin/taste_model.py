@@ -6,15 +6,20 @@ Design contract (see the `edit-apart` skill, "Taste model" section):
   * ONE shared "style-brain" (general film-grammar parameters) + a small
     per-creator identity (a latent `z_u`). Only the identity is per-creator, so
     a per-creator artifact is small and several creators share one style-brain.
-  * The identity modulates the render through FiLM: the shared trunk computes a
-    hidden representation of an edit schema and `z_u` scales/shifts it
-    (`h = (1 + tanh(W_g z)) * h1 + W_b z`). That is NONLINEAR in `z` (tanh) and
-    INTERPOLATABLE (the latent is continuous), which is the property the design
-    asks for.
+  * The identity is ONE latent `z_u` injected at three points of a shared trunk:
+    FiLM on the hidden layer (`h = (1 + tanh(W_g z)) * h1 + W_b z`), a latent gate
+    on the output activations (`a * (1 + tanh(W_s z + b_s))`), and a per-creator
+    linear readout over the features (`x . (z @ W_l)`). That is NONLINEAR in `z`
+    and INTERPOLATABLE (the latent is continuous), which is what the design asks
+    for; a single FiLM stage was measurably not enough for the latent to reorder
+    candidates behind a frozen trunk.
   * Reward is dense + group-relative (GRPO): for a GROUP of K candidate schemas
     proposed for the same clip, `r_k = overall + lambda * sum(deltas)`,
     `A_k = (r_k - mean(r)) / std(r)`, and the update is a PPO-clip surrogate on
-    the group-softmax selection policy.
+    the group-softmax selection policy. Utilities are standardised within the
+    group first, so the logits stay responsive and the latent keeps the ability
+    to reorder candidates. A pick logged with `chosen_by=creator|agent` is a
+    REVEALED preference and becomes that group's top reward.
   * Optimizer split: Muon (Newton-Schulz orthogonalized momentum) on the shared
     2D weight matrices; AdamW on `z_u` and every 1D/bias parameter. Muon must
     never touch a 1D parameter.
@@ -940,7 +945,7 @@ def load_groups(path: str) -> tuple[list[dict], dict]:
     return [groups[g] for g in order], stats
 
 
-def build_training_arrays(path: str, d_h: int, d_z: int, lambda_dense: float = 1.0,
+def build_training_arrays(path: str, lambda_dense: float = 1.0,
                           revealed_pref_bonus: float = 1.0):
     np = _numpy()
     groups, stats = load_groups(path)
@@ -1050,8 +1055,7 @@ def train(dataset: str, identity: str, style: str | None = None, creator: str = 
     matrices (lr 0.02 measurably oversteps: training accuracy stalls ~0.5).
     """
     np = _numpy()
-    prepared, stats = build_training_arrays(dataset, d_h, d_z, lambda_dense,
-                                            revealed_pref_bonus)
+    prepared, stats = build_training_arrays(dataset, lambda_dense, revealed_pref_bonus)
     usable = [p for p in prepared if p["X"].shape[0] >= 2]
     if not usable:
         raise SystemExit(

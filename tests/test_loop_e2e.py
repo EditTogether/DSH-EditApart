@@ -114,14 +114,14 @@ class TestLoopE2E(unittest.TestCase):
     def test_loop_records_groups_and_revealed_picks(self):
         import taste_model as tm
         ds = self._corpus("probe", self.neutral[:3], longer=True)
-        _, stats = tm.build_training_arrays(ds, 24, 16)
+        _, stats = tm.build_training_arrays(ds)
         self.assertEqual(stats["groups_usable"], 3)
         self.assertEqual(stats["reward_records"], 3)
         self.assertEqual(stats["bad_lines"], 0)
         groups, _ = tm.load_groups(ds)
         self.assertTrue(all(g["chosen_by"] == "creator" for g in groups))
         # the revealed pick must become the group's best reward
-        prepared, _ = tm.build_training_arrays(ds, 24, 16)
+        prepared, _ = tm.build_training_arrays(ds)
         for p in prepared:
             self.assertEqual(int(p["rewards"].argmax()), p["chosen"],
                              "the revealed creator pick is not the top reward")

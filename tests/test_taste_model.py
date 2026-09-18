@@ -286,10 +286,10 @@ class TestDatasetFolding(unittest.TestCase):
             self.assertEqual(g["candidates"][0]["reward_source"], "critic")
 
             # lambda_dense is applied to the separate overall/dense components.
-            prepared, _ = tm.build_training_arrays(path, 24, 16, lambda_dense=1.0)
+            prepared, _ = tm.build_training_arrays(path, lambda_dense=1.0)
             g1 = next(p for p in prepared if p["group_id"] == "g1")
             self.assertAlmostEqual(float(g1["rewards"][0]), 0.5 - 0.25, places=6)
-            prepared2, _ = tm.build_training_arrays(path, 24, 16, lambda_dense=2.0)
+            prepared2, _ = tm.build_training_arrays(path, lambda_dense=2.0)
             g1b = next(p for p in prepared2 if p["group_id"] == "g1")
             self.assertAlmostEqual(float(g1b["rewards"][0]), 0.5 - 0.5, places=6)
 
@@ -500,7 +500,7 @@ class TestEngineWiring(unittest.TestCase):
         self.assertIn("logged", crit)
         groups, _ = tm.load_groups(ds)
         self.assertEqual(len(groups), 1)
-        _, stats = tm.build_training_arrays(ds, 24, 16)
+        _, stats = tm.build_training_arrays(ds)
         self.assertEqual(stats["groups_usable"], 1)
         g = groups[0]
         self.assertEqual(g["chosen"], out["group"]["selected"])

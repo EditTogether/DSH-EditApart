@@ -3,9 +3,13 @@ description: >-
   A taste-driven automated video AND photo editor. Takes raw footage, builds a
   shot inventory (scenedetect), proposes an EDIT DECISION SCHEMA against a
   declared editorial rubric, renders it deterministically, critiques it against
-  the rubric, and revises until it converges. The identity's taste lives in a
-  per-creator style model (shared style-brain weights + per-user latent) learned
-  with GRPO. Photo editing is image-only — ONE FEWER input modality than video
+  the rubric, and revises until it converges. Until it converges, the loop
+  records the group of candidate edits it considered plus the outcome for the one
+  that was rendered; the identity's taste lives in a per-creator style model
+  (one shared style-brain trunk + a per-creator latent z_u) trained from those
+  logged groups with GRPO (group-relative advantage + PPO-clip, Muon on 2D
+  weights and AdamW on the latent). Both artifacts are real GGUF files and a
+  later propose_schema selects with the trained identity. Photo editing is image-only — ONE FEWER input modality than video
   (no `video` modality, no video-in/out registration) — so it works with the
   existing image-capable general model, and its renderer (ImageMagick) is not a
   hard dependency (a web-profile in-browser renderer may supply it). The general

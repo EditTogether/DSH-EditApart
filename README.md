@@ -7,8 +7,9 @@ ffmpeg/scenedetect (and ImageMagick for photos), critiques the render against th
 rubric, and **revises** until it converges.
 
 It does **not** operate a video-editing GUI. It reasons about editorial judgment.
-The plugin registers both video and photo tools (12 total) under one identity;
-the engines are `bin/edit_apart_core.py` (video) and `bin/photo_core.py` (photo).
+The plugin registers both video and photo tools plus the taste-model tools (15
+total) under one identity; the engines are `bin/edit_apart_core.py` (video),
+`bin/photo_core.py` (photo) and `bin/taste_model.py` (the per-creator model).
 
 ## The core design
 
@@ -17,15 +18,18 @@ the engines are `bin/edit_apart_core.py` (video) and `bin/photo_core.py` (photo)
   between "AI intent" and "the render."
 - **General grammar is shared; taste is per-creator.** One shared style-brain
   (film-grammar parameters) + a small per-creator identity latent `z_u` in a
-  per-creator GGUF. Only the identity is per-creator.
+  per-creator GGUF. Only the identity is per-creator — the artifact holds `z_u`
+  and a digest of the trunk it belongs to, nothing else.
 - **Reward is dense + group-relative (GRPO).** The critic scores a render AND
   yields per-element keep/drop/why deltas; `r = overall + λ·Σ(deltas)`. Group
   relative advantage `A_k = (r_k − mean(r))/std(r)`, then a PPO-clip step.
 - **Muon on weights, AdamW on the latent.** Muon orthogonalizes momentum for
   2D weight matrices; **never** the identity latent (Newton-Schulz degenerates
   on 1D). AdamW handles `z_u` and all 1D/bias/embed params.
-- **Self-play interleaved with history.** Sample candidate schemas from the
-  current policy + reuse the creator's logged prior edits, overnight.
+- **Self-play interleaved with history.** `propose_schema` emits a *group* of
+  candidate schemas from a deterministic grid; the group is logged, one candidate
+  is selected, and the render/vision/creator outcome is logged back against it.
+  Training consumes those groups overnight.
 - **Three model portions, and only one is the session model.** General (the
   session model: reads footage, proposes, critiques) · FilmGPT style-brain
   (shared film grammar) · creator taste (`z_u`). A video-in/out model like
@@ -57,22 +61,29 @@ source ─► inventory ─► shot inventory
                │
      features ─► per-shot luminance/motion/audio
                │
-   propose_schema + rubric ─► EDIT DECISION SCHEMA
+  propose_schema + rubric ─► GROUP of candidate EDIT DECISION SCHEMAS
+               │                    │         (logged to .editapart/taste_samples.jsonl)
+               │                    ▼
+               │        taste identity scores the group ─► selected schema
                │
     render_schema ─► deterministic ffmpeg render
                │
     critic_edit ─► score + per-element keep/drop/why deltas
+               │                    │         (logged as that candidate's reward;
+               │                    │          chosen_by=creator|agent = revealed preference)
+    revise_schema ─► revised schema ─► re-render (bounded loop)
                │
-   revise_schema ─► revised schema ─► re-render (bounded loop)
+   train_identity ─► shared style-brain GGUF + per-creator z_u GGUF
 ```
 
-> **Status of the taste model.** The 12 tools above are implemented and the
-> render→critique→revise loop is what the plugin actually runs. The **identity
-> learning** (`bin/train_identity.py`, GRPO + Muon/AdamW) is a **runnable
-> research scaffold** — it implements the objective and the optimizer split
-> against a toy model so the step is verifiable, but it is **not wired into the
-> tool loop and does not yet produce a real per-creator model.** Treat it as the
-> next milestone, not a shipped feature.
+> **Status of the taste model.** The identity learning is **implemented and wired
+> into the loop**, not a scaffold. `propose_schema` builds and logs a group of
+> candidates, selects one with the creator identity when it exists, `critic_edit`
+> logs the reward for the candidate that was actually rendered, and
+> `train_identity` fits the shared style-brain plus that creator's latent `z_u`
+> and writes real GGUF artifacts. The measured claims and their limits are in
+> [Taste model](#taste-model-wired-measured) below — including what it does *not*
+> do yet (trained selector, **not** a fine-tuned language model; video only).
 
 ### Photo editing (image-only)
 
@@ -83,6 +94,103 @@ A parallel single-image loop, mounted via the `edit-apart` plugin:
 `video`), and its renderer is **not a hard dependency** (resolved at runtime;
 a web-profile in-browser ImageMagick/ffmpeg may supply it).
 
+## Taste model (wired, measured)
+
+`bin/taste_model.py` is the per-creator model; `bin/train_identity.py` is its CLI.
+The loop in `bin/edit_apart_core.py` drives it.
+
+**Architecture.** A shared trunk over 16 named edit features (pacing, shot
+selection, tempo, energy, order) feeds a hidden layer that the creator latent
+modulates three ways:
+
+```
+u = tanh-free ranking score =
+      (a ⊙ (1 + tanh(W_s z + b_s))) @ W2 + b2     # latent gates the hidden activations
+    + (z @ W_z + b_z)                              # latent output offset
+    + x · (z @ W_l)                                # per-creator linear readout over the features
+```
+
+`z_u` is the only per-creator tensor, so a creator artifact is ~1 KB while the
+trunk is shared. The map is nonlinear in `z` (tanh gates, multiplicative terms)
+and interpolatable (the latent is continuous; a midpoint latent scores between
+its endpoints — asserted in the test suite).
+
+**Objective.** For each clip the loop logs a group of candidates with the critic's
+dense reward. GRPO turns that into group-relative advantages
+`A_k = (r_k − mean r)/std r`, and the update is a PPO-clip surrogate on the
+group-softmax selection policy, plus an auxiliary pairwise preference loss over
+the pick that was actually rendered and a small entropy bonus. Utilities are
+standardised *within* the candidate group before the softmax: this keeps the
+logits responsive so the latent can always reorder candidates — with an
+unbounded-then-squashed output the utilities saturate under the margin objective
+and the latent loses all authority over the ordering (measured: 12/12 neutral
+briefs identical, versus 12/12 different after the fix).
+
+**Optimizer split.** Muon (quintic Newton-Schulz, coefficients and nesterov form
+from the reference Muon implementation) on 2D weights; AdamW on `z_u` and every
+1D/bias parameter. Muon's lr is in **spectral-norm units**, so on these small
+matrices it must be ~10× below an Adam lr — at the higher lr the model stops
+fitting (measured: training accuracy stalls at ~0.5 versus ~0.85).
+
+**Artifacts.** Real GGUF v3 files (F32 tensors + metadata): a shared
+`style_brain_video_v1.gguf` and a tiny per-creator `<creator>.gguf` carrying
+`z_u`, the feature layout, and the digest of the trunk it was trained against. A
+digest mismatch is refused rather than silently scoring with the wrong trunk.
+
+### How the loop feeds it
+
+```bash
+# 1. propose a GROUP (logged automatically); the best candidate by the identity
+#    is selected, or by the objective critic reward when no identity exists yet
+propose_schema inventory=<inv> rubric=<rub> group=4
+
+# 2. render the selected candidate, then log that group's outcome
+critic_edit schema=<schema> inventory=<inv> rubric=<rub> group_id=<id> \
+            candidate=<idx> chosen_by=creator
+
+# 3. inspect and train
+taste_status
+train_identity creator=erkin            # writes .editapart/identity.gguf
+train_identity creator=erkin freeze_style=true   # later: only z_u moves
+```
+
+`chosen_by=creator|agent` matters: a pick that overrides the objective ranking is
+logged as a **revealed preference** and becomes that group's top reward. Without
+it the rubric-driven critic reward dominates and creators converge to identical
+edits (measured: two creators picked identically on 12/12 briefs).
+
+### Measured results
+
+| Claim | Measurement |
+| --- | --- |
+| Gradients are correct | analytic vs finite differences: **1.7e-08** (model) / **1.7e-09** (full objective, incl. preference term) |
+| Objective recovers a hidden preference | held-out pairwise agreement **0.82–0.84** vs 0.50 chance; argmax **0.55–0.86** vs 0.20 chance (3 seeds, 120 synthetic clips) |
+| The identity is interpolatable | midpoint latent brackets the endpoints for ≥70% of candidates and moves the mean monotonically |
+| Optimizer split holds | Muon touches 2D only, AdamW 1D only (asserted, with witnesses) |
+| Artifacts round-trip | GGUF write→read bit-exact; digest mismatch refused |
+| The identity changes the loop | two creators on the same shared trunk: **12/12** neutral briefs differed, 12/12 in the predicted direction, **24.9s vs 12.0s** mean selected duration |
+| The loop is numpy-optional | legacy `propose group=1` and group logging work with numpy blocked; only the model path errors |
+
+Reproduce with `tests/test_taste_model.py` (35 tests, no media needed) and
+`tests/test_loop_e2e.py` (real footage; see **Verification**).
+
+### Boundaries (honest)
+
+- **The trained policy is the selector, not the language model.** Training changes
+  which candidate the loop picks among the ones this engine generates; it does
+  not fine-tune an LLM, and it cannot invent an edit the candidate grid does not
+  contain.
+- **Video only.** The design's v0 scope is pacing + shot selection + tempo, which
+  is what the feature layout covers. Photo taste (colour/composition) is the next
+  phase; the model is generic over feature specs, but `photo_propose` still emits
+  a single rubric-derived schema and logs nothing.
+- **It needs enough clips.** Held-out accuracy is only meaningful once there are
+  several logged clips; with one or two the model fits them and generalises
+  nothing. `taste_status` reports how many trainable groups are in the log.
+- **The trunk is shared, so per-creator training freezes it** (`freeze_style=true`);
+  a normal run trains the trunk too and is meant for building the shared model
+  from the union of several creators' logs.
+
 ## How to use it
 
 1. Provision the toolchain (see **Portable install** below) or make sure
@@ -90,9 +198,10 @@ a web-profile in-browser ImageMagick/ffmpeg may supply it).
 2. Start a session on this preset (select `ai-video-editor` / EditApart in the
    mode picker). The preset mounts its own `edit-apart` plugin, so the tools
    `inventory`, `features`, `propose_schema`, `render_schema`,
-   `review_frames`, `critic_edit`, `revise_schema`, `photo_inspect`,
-   `photo_propose`, `photo_render`, `photo_critic`, and `photo_revise` appear in
-   that session's catalog.
+   `review_frames`, `critic_edit`, `revise_schema`, `train_identity`,
+   `taste_status`, `identity_init`, `photo_inspect`, `photo_propose`,
+   `photo_render`, `photo_critic`, and `photo_revise` appear in that session's
+   catalog.
 3. The bundled `edit-apart` skill drives the loop.
 4. Toolchains are **resolved at runtime, not hard-locked**: `ffmpeg`/`ffprobe`/
    `scenedetect`/Python (video) and ImageMagick (photo) come from the matching
@@ -121,11 +230,20 @@ source ./env.sh        # makes DSH_EDIT_PY / DSH_SCENEDETECT available for this 
 - `.dshenv` — machine-local paths the plugin auto-loads when the matching
   `DSH_*` env is not already set (gitignored).
 - `requirements.txt` — `scenedetect` (+ `numpy<2` to avoid the opencv
-  `KeyError: 'rad2deg'` import crash).
+  `KeyError: 'rad2deg'` import crash). `numpy` is a scenedetect dependency anyway
+  and is what the taste model runs on; the legacy loop (`propose group=1`) works
+  without it.
 - `setup.sh` — creates the venv, installs deps, writes `env.sh`/`.dshenv`.
 
 Override keys: `DSH_EDIT_PY`, `DSH_SCENEDETECT`, `DSH_FFMPEG`, `DSH_FFPROBE`,
 `DSH_IMAGEMAGICK`.
+
+Taste-model keys: `DSH_EDITAPART_IDENTITY` (per-creator GGUF),
+`DSH_EDITAPART_DATASET` (group log), `DSH_EDITAPART_DATA` (directory holding both,
+default `<workspace>/.editapart`), `DSH_EDITAPART_STYLE` (shared style-brain path)
+and `DSH_EDITAPART_GROUP` (candidates per proposal, default 4). The identity and
+the log are per-workspace on purpose, so each project accumulates its own
+creator history.
 
 > The plugin is **import-free** on purpose: a user-preset relative-mounted
 > module cannot import `@deepseek-ai/*` (its internal imports resolve against
@@ -187,5 +305,36 @@ On a synthetic 1800×1200 landscape (`photo.jpg`), rubric = warm punch, saturati
 - Schema: crop → grade → resize.
 - Render: 1200×1000. Critic: overall 0.5, exposure_ok/contrast_ok true,
   reward 0.5, all ops kept; revise kept crop/grade/resize.
+
+## Verification
+
+```bash
+# model + loop unit suite: 35 tests, no media required (~25s)
+~/dsh-edit-venv/bin/python tests/test_taste_model.py -v
+
+# end-to-end on real footage (scenedetect + ffmpeg + a real render)
+DSH_EDIT_PY=~/dsh-edit-venv/bin/python \
+DSH_SCENEDETECT=~/dsh-edit-venv/bin/scenedetect \
+DSH_EDITAPART_E2E_SRC=/path/to/footage.mp4 \
+~/dsh-edit-venv/bin/python tests/test_loop_e2e.py -v
+```
+
+The unit suite checks Newton-Schulz's bounded band and scale invariance, the
+optimizer split (Muon never sees a 1D gradient, AdamW never sees a 2D one),
+analytic gradients against finite differences, GGUF round-trips and digest
+mismatch refusal, dataset folding (including legacy records and broken lines),
+learning on a synthetic hidden preference, latent ablation/interpolation,
+`group=1` reproducing the legacy schema exactly, critic-reward logging, and
+graceful degradation when numpy is unavailable.
+
+The E2E suite builds an inventory from real footage, drives two creators with
+different revealed preferences through the real loop, trains one shared trunk
+plus two frozen-trunk identities, and asserts that the same neutral brief gets
+materially different edits — then renders the taste-selected schema with real
+ffmpeg and critiques/revises it. Measured on
+`better-com-ceo-roasted-by.mp4` (41.7s, 23 shots): 12/12 briefs differed,
+long-take 24.9s vs short-take 12.0s mean selected duration; the rendered
+taste-selected edit was 18.75s, critic overall −0.15, 10 → 7 segments after
+revise.
 
 See `skills/edit-apart/SKILL.md` for the full protocol.

@@ -10,3 +10,8 @@ env.sh
 # Output artifacts from reference runs
 *.mp4
 *.png
+
+# Per-workspace taste data the loop accumulates: the creator's group log and the
+# identity GGUF bound to this workspace's style-brain. An identity you intend to
+# share belongs somewhere you choose explicitly — *.gguf is NOT mass-ignored.
+.editapart/

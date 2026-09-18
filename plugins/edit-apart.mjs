@@ -5,6 +5,8 @@
 //                     review_frames, critic_edit, revise_schema) -> bin/edit_apart_core.py
 //   * 5 photo tools  (photo_inspect, photo_propose, photo_render, photo_critic,
 //                     photo_revise)                           -> bin/photo_core.py
+//   * 3 taste-model tools (train_identity, taste_status, identity_init)
+//                     -> bin/edit_apart_core.py -> bin/taste_model.py
 //   * 1 guarded model-routing hook (video-in/out general model) -> opt-in via env.
 //
 // Mounted by the `ai-video-editor` (EditApart) preset via a RELATIVE path
@@ -19,7 +21,7 @@
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { readFileSync } from 'node:fs'
+import { readFileSync, existsSync } from 'node:fs'
 
 export const name = 'edit-apart'
 export const inject = ['tools', 'systemPrompt']
@@ -46,6 +48,19 @@ loadDSHEnv()
 const PY = process.env.DSH_EDIT_PY || 'python3'
 const VIDEO_CORE = join(HERE, '..', 'bin', 'edit_apart_core.py')
 const PHOTO_CORE = join(HERE, '..', 'bin', 'photo_core.py')
+
+// Where the per-creator taste model lives. The identity (a GGUF holding only the
+// creator's latent z_u) and the group log the editor writes are per-WORKSPACE by
+// default, so each project accumulates its own creator history. Override with
+// DSH_EDITAPART_IDENTITY / DSH_EDITAPART_DATASET / DSH_EDITAPART_DATA.
+const DATA_DIR = process.env.DSH_EDITAPART_DATA || join(process.cwd(), '.editapart')
+const IDENTITY = process.env.DSH_EDITAPART_IDENTITY || join(DATA_DIR, 'identity.gguf')
+const DATASET = process.env.DSH_EDITAPART_DATASET || join(DATA_DIR, 'taste_samples.jsonl')
+const STYLE = process.env.DSH_EDITAPART_STYLE || ''
+// How many candidate schemas a proposal explores. >1 turns propose_schema into a
+// group proposal: the group is logged, the best candidate is selected by the
+// creator identity when one exists (otherwise by the objective critic reward).
+const GROUP_DEFAULT = String(process.env.DSH_EDITAPART_GROUP || '4')
 
 // Run an engine; it emits JSON on stdout and {error} on failure, exit 2 on a
 // caught engine error.
@@ -124,17 +139,30 @@ export function apply(ctx) {
     },
     {
       name: 'propose_schema',
-      description: 'Propose an EDIT DECISION SCHEMA from a shot inventory against a rubric (pacing + shot-selection; v0).',
+      description: 'Propose an EDIT DECISION SCHEMA from a shot inventory against a rubric (pacing + shot-selection; v0). With group>1 it proposes a GROUP of candidate schemas, logs the group for taste training, and selects the candidate preferred by the per-creator identity when one exists (otherwise the best objective critic reward).',
       parameters: {
         type: 'object',
         properties: {
           inventory: { type: 'string', description: 'Inventory JSON (stringified).' },
           rubric: { type: 'string', description: 'Rubric JSON (stringified): min_shot_dur, max_shot_dur, target_duration, pace.' },
+          group: { type: 'number', description: `Candidate schemas to consider (1 = legacy single schema). Default ${GROUP_DEFAULT}.` },
+          identity: { type: 'string', description: 'Per-creator taste GGUF to select with. Default: the workspace identity if it exists.' },
+          select: { type: 'string', enum: ['auto', 'taste', 'objective'], description: 'auto (taste if an identity exists), taste, or objective.' },
+          no_log: { type: 'boolean', description: 'Do not append this group to the training log.' },
         },
         required: ['inventory', 'rubric'],
       },
       output: outSchema,
-      execute: (args) => runCore(VIDEO_CORE, ['propose', args.inventory, args.rubric]),
+      execute: (args) => {
+        const argv = ['propose', args.inventory, args.rubric,
+          '--group', String(args.group ?? GROUP_DEFAULT), '--dataset', DATASET]
+        const identity = args.identity ?? IDENTITY
+        if (identity && existsSync(identity)) argv.push('--identity', identity)
+        if (STYLE) argv.push('--style', STYLE)
+        if (args.select) argv.push('--select', String(args.select))
+        if (args.no_log) argv.push('--no-log')
+        return runCore(VIDEO_CORE, argv)
+      },
     },
     {
       name: 'render_schema',
@@ -178,13 +206,22 @@ export function apply(ctx) {
           inventory: { type: 'string', description: 'Enriched inventory JSON (stringified).' },
           rubric: { type: 'string', description: 'Rubric JSON (stringified).' },
           subjective: { type: 'number', description: '0..1 vision-model judgment to fold in (optional).' },
+          group_id: { type: 'string', description: 'Group id from propose_schema: logs this outcome as the group\'s reward.' },
+          candidate: { type: 'number', description: 'Which candidate of the group this critique is for (default 0).' },
+          chosen_by: { type: 'string', enum: ['critic', 'creator', 'agent'], description: 'Who picked this candidate. A creator/agent pick is logged as a REVEALED preference and becomes the group\'s top reward.' },
         },
         required: ['schema', 'inventory', 'rubric'],
       },
       output: outSchema,
       execute: (args) => {
-        const sub = args.subjective == null ? [] : ['--subjective', String(args.subjective)]
-        return runCore(VIDEO_CORE, ['critic', args.schema, args.inventory, args.rubric, ...sub])
+        const argv = ['critic', args.schema, args.inventory, args.rubric]
+        if (args.subjective != null) argv.push('--subjective', String(args.subjective))
+        if (args.group_id) {
+          argv.push('--dataset', DATASET, '--group-id', String(args.group_id),
+                    '--candidate', String(args.candidate ?? 0),
+                    '--chosen-by', String(args.chosen_by ?? 'critic'))
+        }
+        return runCore(VIDEO_CORE, argv)
       },
     },
     {
@@ -200,6 +237,59 @@ export function apply(ctx) {
       },
       output: outSchema,
       execute: (args) => runCore(VIDEO_CORE, ['revise', args.schema, args.critic]),
+    },
+    // ---- taste model ----
+    {
+      name: 'train_identity',
+      description: 'Train the per-creator taste identity from the groups the loop has logged: one shared style-brain trunk (Muon on 2D weights) plus this creator\'s latent z_u (AdamW), optimised by a GRPO group-relative PPO-clip objective with an auxiliary preference loss over revealed picks. Returns held-out ranking metrics and writes the per-creator GGUF.',
+      parameters: {
+        type: 'object',
+        properties: {
+          creator: { type: 'string', description: 'Creator name recorded in the artifact. Default "default".' },
+          epochs: { type: 'number', description: 'Training epochs (default 150).' },
+          freeze_style: { type: 'boolean', description: 'Train ONLY z_u against the frozen shared trunk (the per-creator step; requires an existing style-brain).' },
+          holdout_every: { type: 'number', description: 'Hold out every Nth clip for the reported held-out metrics.' },
+          seed: { type: 'number', description: 'Deterministic seed.' },
+          verbose: { type: 'boolean', description: 'Per-epoch progress on stderr.' },
+        },
+      },
+      output: outSchema,
+      execute: (args) => {
+        const argv = ['train', '--dataset', DATASET, '--identity', IDENTITY]
+        if (STYLE) argv.push('--style', STYLE)
+        if (args.creator) argv.push('--creator', String(args.creator))
+        if (args.epochs != null) argv.push('--epochs', String(args.epochs))
+        if (args.freeze_style) argv.push('--freeze-style')
+        if (args.holdout_every != null) argv.push('--holdout-every', String(args.holdout_every))
+        if (args.seed != null) argv.push('--seed', String(args.seed))
+        if (args.verbose) argv.push('--verbose')
+        return runCore(VIDEO_CORE, argv)
+      },
+    },
+    {
+      name: 'taste_status',
+      description: 'Report the state of the wired-in taste loop: whether the per-creator identity exists, how many groups/clips have been logged, how many are trainable, and the reward spread.',
+      parameters: { type: 'object', properties: {
+        identity: { type: 'string', description: 'Identity GGUF (default: the workspace identity).' },
+        dataset: { type: 'string', description: 'Group log (default: the workspace log).' },
+      } },
+      output: outSchema,
+      execute: (args) => runCore(VIDEO_CORE, ['taste_status',
+        '--identity', args.identity ?? IDENTITY, '--dataset', args.dataset ?? DATASET]),
+    },
+    {
+      name: 'identity_init',
+      description: 'Create a zero-latent per-creator identity bound to a (possibly new) shared style-brain, so a brand-new creator can run the loop immediately and train from zero.',
+      parameters: { type: 'object', properties: {
+        creator: { type: 'string', description: 'Creator name. Default "default".' },
+        identity: { type: 'string', description: 'Identity GGUF to create (default: the workspace identity).' },
+      } },
+      output: outSchema,
+      execute: (args) => {
+        const argv = ['identity_init', '--identity', args.identity ?? IDENTITY]
+        if (args.creator) argv.push('--creator', String(args.creator))
+        return runCore(VIDEO_CORE, argv)
+      },
     },
     // ---- photo ----
     {
@@ -298,7 +388,7 @@ export function apply(ctx) {
   ctx.systemPrompt.section({
     name: 'tool:edit-apart',
     order: 106,
-    text: 'You are a taste-driven video + photo editor (EditApart). Prefer the edit-apart tools (inventory, features, propose_schema, render_schema, review_frames, critic_edit, revise_schema, and photo_inspect/photo_propose/photo_render/photo_critic/photo_revise) over ad-hoc commands for any edit task. Always review_frames before dropping a shot — the vision leg is normative; motion-luma is only a hint. For photos, read the result image with your eyes before dropping an operation.',
+    text: 'You are a taste-driven video + photo editor (EditApart). Prefer the edit-apart tools (inventory, features, propose_schema, render_schema, review_frames, critic_edit, revise_schema, train_identity, taste_status, identity_init, and photo_inspect/photo_propose/photo_render/photo_critic/photo_revise) over ad-hoc commands for any edit task. propose_schema returns a GROUP of candidate edits and selects one; when you render a DIFFERENT candidate than the selected one, or a human picks one, log it with critic_edit chosen_by=creator|agent — that revealed pick is what teaches the per-creator taste identity. Run train_identity when the log has enough clips (taste_status shows the count), then later proposals are selected by that learned identity. Always review_frames before dropping a shot — the vision leg is normative; motion-luma is only a hint. For photos, read the result image with your eyes before dropping an operation.',
   })
 
   return disposeAll

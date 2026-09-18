@@ -30,11 +30,18 @@ because it is not on PATH, use the venv absolute path. Python 3.14.
    on-beat residual (if a beat grid is declared). Emit a JSON shot list.
 2. **Declared rubric** — write/read an explicit editorial spec. It is the
    *constraint + intent* layer. It wins on explicit conflict.
-3. **Propose schema** — pick shots, order & trim them, set transitions, grade,
-   audio, and a `why` per segment. The schema must satisfy hard rubric
-   constraints while the identity latent fills the underspecified taste.
+3. **Propose schema** — `propose_schema group=K` builds a *group* of candidates
+   from a deterministic grid (pacing/target/length knobs); pick shots, order &
+   trim them, set transitions, grade, audio, and a `why` per segment. The schema
+   must satisfy hard rubric constraints while the identity latent fills the
+   underspecified taste. The group is logged automatically; the selected
+   candidate is the identity's argmax when an identity exists, else the best
+   objective reward. **If you or the creator prefers a DIFFERENT candidate than
+   the selected one, render that one and log it with `chosen_by=creator|agent`.**
 4. **Render** — deterministic ffmpeg graph from the schema (see renderer).
-5. **Critique** — the critic has TWO legs. **Objective** (computed, not
+5. **Critique** — pass the group id and candidate index so the reward lands on
+   the candidate that was actually rendered (`chosen_by=creator|agent` when the
+   pick was a preference, not the objective winner). The critic has TWO legs. **Objective** (computed, not
    eyeballed): `critic_edit` scores duration/motion/target against the rubric.
    **Subjective** (read from the actual FRAMES): call `review_frames` to
    extract one frame per segment, then LOOK at them and judge keep/drop/why.
@@ -61,8 +68,15 @@ because it is not on PATH, use the venv absolute path. Python 3.14.
 > number — this is the difference between "meets the duration rule" and "this is
 > the beat worth keeping."
 
-If the task is only "edit this footage once," you still run 1→6. If the task
-is "train the taste," you additionally run the learn step.
+If the task is only "edit this footage once," you still run 1→6 (steps 3 and 5
+still log the group and the reward — that is what makes the next session
+trainable). If the task is "train the taste," run the learn step:
+
+7. **Learn** — `taste_status` to see how many groups are logged, then
+   `train_identity` (shared trunk + this creator's `z_u`; `freeze_style=true` for
+   a per-creator run against an existing trunk). Report the held-out metrics it
+   returns; they are the only quality claim. Every later `propose_schema` then
+   selects with that identity.
 
 ## The EDIT DECISION SCHEMA
 
@@ -228,7 +242,11 @@ is ImageMagick, never an AI paint-over.
 
 There is **one shared style-brain** (the general film-grammar parameters) and
 **one small per-creator identity** (the latent `z_u` inside a per-creator GGUF).
-The style-brain is shared; only the identity is per-creator.
+The style-brain is shared; only the identity is per-creator. This is implemented
+and wired: `bin/taste_model.py` is the model, `train_identity` the trainer, and
+`propose_schema`/`critic_edit` feed it. The trained policy is the **candidate
+selector** — it decides which of the proposed edits you would prefer; it is not a
+fine-tuned language model.
 
 - **General grammar = base** — film-grammar craft rules. Shared, and the
   general LLM (this session) already carries the craft.
@@ -241,12 +259,23 @@ The style-brain is shared; only the identity is per-creator.
   critic's per-element keep/drop/why deltas: `r = overall_score + λ·Σ(promoted_element_deltas)`.
 - **Training** — **group-relative advantage**: sample a *group* of candidate
   schemas per clip, `A_k = (r_k − mean(r))/std(r)`, then a PPO-clip surrogate
-  step. Interleave **self-play** (sampled from the current policy) with
-  **history** (from the creator's logged prior edits). Anneal the history
-  weight down over the run.
-- **Seed the latent from the rubric** rather than from noise; refine it with
-  GRPO. Overnight is fine — renders and local inference are expensive, so do
-  long batches and think of the editor as its own data generator.
+  step (this is what `propose_schema group=K` + `train_identity` do for real).
+  Interleave **self-play** (the deterministic candidate grid) with **history**
+  (the creator's logged prior edits).
+- **Revealed preference beats the heuristic.** When the creator or the agent
+  renders a candidate that is *not* the one the objective reward prefers, log
+  `critic_edit … chosen_by=creator|agent`. That pick becomes the group's top
+  reward. Without it the rubric-driven reward dominates and every creator
+  converges to the same edits — measured: two creators picked identically on
+  12/12 neutral briefs.
+- **Muon's lr is in spectral-norm units** — on this small trunk it must be ~10×
+  below an Adam lr (`0.005`), otherwise it oversteps and stops fitting
+  (training accuracy stalls near 0.5 instead of ~0.85).
+- **Utilities are standardised per candidate group** before the softmax. That is
+  what keeps the latent able to reorder candidates; an unbounded-then-squashed
+  output saturates under the margin objective and the identity loses its effect.
+- Overnight is fine — renders and local inference are expensive, so do long
+  batches and think of the editor as its own data generator.
 
 ## Invocation — the bundled tools
 
@@ -257,14 +286,35 @@ ad-hoc bash, for the whole loop. They map 1:1 onto the engines (`bin/edit_apart_
   shot list. Raise `threshold` for fewer cuts, lower for more.
 - `features(src, inventory)` — per-shot luminance (p50/p95), motion, audio
   RMS/peak.
-- `propose_schema(inventory, rubric)` — rubric → EDIT DECISION SCHEMA.
+- `propose_schema(inventory, rubric, group?, identity?, select?, no_log?)` —
+  rubric → a **GROUP** of candidate EDIT DECISION SCHEMAS (deterministic grid,
+  `group=1` = the single legacy schema), logged to the creator's group log, with
+  one candidate selected: by the per-creator identity when one exists, else by
+  the objective critic reward.
 - `render_schema(src, schema, out)` — deterministic ffmpeg render.
 - `review_frames(src, schema, outdir, size?)` — one mid-segment frame per
   segment, the input for the subjective (vision) critic leg.
-- `critic_edit(schema, inventory, rubric, subjective?)` — objective metrics +
-  dense per-element keep/drop/why deltas + reward; optionally fold a
-  vision-model `subjective` score (0..1) in.
+- `critic_edit(schema, inventory, rubric, subjective?, group_id?, candidate?,
+  chosen_by?)` — objective metrics + dense per-element keep/drop/why deltas +
+  reward; optionally fold a vision-model `subjective` score (0..1) in. With
+  `group_id`, the outcome is logged as that candidate's reward — pass
+  `chosen_by=creator|agent` when the pick was a human/agent preference rather
+  than the objective winner (that is what teaches the identity).
 - `revise_schema(schema, critic)` — apply critic verdict, drop + retime.
+- `taste_status(identity?, dataset?)` — is there an identity? how many groups are
+  logged and trainable?
+- `train_identity(creator?, epochs?, freeze_style?, seed?)` — fit the shared
+  style-brain + this creator's latent `z_u` (Muon on 2D, AdamW on `z_u`/1D, GRPO
+  + preference loss) and write the per-creator GGUF. Reports held-out metrics:
+  pairwise agreement (chance 0.5) and argmax accuracy (chance 1/K). Use
+  `freeze_style=true` for a per-creator run against the frozen shared trunk.
+- `identity_init(creator?)` — zero-latent identity so a new creator can start.
+
+After `identity_init`/`train_identity`, later `propose_schema` calls select with
+that identity automatically (override with `select=objective` or `identity=…`).
+Treat the reported held-out accuracy as the only quality claim: training more
+clips is what makes it meaningful, and `chosen_by=creator` picks are what make it
+*yours*.
 
 All take/return JSON strings for the inventory/rubric/schema/critic payloads.
 The persona and tool catalog already describe them; prefer these over running
@@ -284,7 +334,13 @@ The persona and tool catalog already describe them; prefer these over running
 - Do not invent schema fields the renderer can't consume.
 - Do not treat "AI taste" as a vibe to improvise — write the rubric and score
   against it.
-- Do not use Muon on the identity latent.
+- Do not use Muon on the identity latent (or on any 1D parameter).
+- Do not drop `chosen_by=creator|agent` when a human/agent pick overrode the
+  objective winner — that flag is the taste signal.
+- Do not call `train_identity` and then present the artifact as "trained taste"
+  without the held-out numbers; report the accuracy or say it is untrained.
+- Do not expect photo taste to be learned yet: the identity is wired into the
+  video loop (pacing/shot selection/tempo). Photo remains rubric-driven.
 - Do not present a single-pass guess as a final edit; always critique and
   revise at least once.
 - **Do not rely on the objective heuristic alone.** A steady talking head with a

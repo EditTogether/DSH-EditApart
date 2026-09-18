@@ -10,17 +10,36 @@ The plugin invokes it as:
     edit_apart_core.py <subcommand> <args...>
 
 Subcommands mirror the tools: inventory | features | propose | render |
-review_frames | critic | revise. Each reads JSON on stdin and writes JSON to
+review_frames | critic | revise | train | taste | taste_features | taste_status |
+identity_init | identity_info. Each reads JSON on stdin and writes JSON to
 stdout, so the plugin can pass args through and surface the result directly.
+
+The taste model (bin/taste_model.py) is wired in HERE, in the loop itself:
+
+  * `propose` builds a GROUP of candidate schemas from a deterministic grid,
+    scores each with the creator identity when one is configured, selects a
+    candidate, and appends the group to the creator's training log.
+  * `critic` can append the render + vision outcome for the selected candidate
+    (that is the reward the trainer consumes).
+  * `train` fits the shared style-brain + the creator latent (Muon on 2D, AdamW
+    on z_u and 1D) and writes the per-creator GGUF.
+  * `render` / `review_frames` / `revise` are untouched.
+
+Every piece is optional and off unless asked for: with no identity and
+`group=1` the returned `structure`/`meta`/`globals` are exactly what the engine
+returned before the taste model was wired in (an additive `group` key is the
+only difference).
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 
 # Toolchains are resolved at runtime, NOT hard-locked. A deployment may set
 # DSH_FFMPEG / DSH_FFPROBE / DSH_SCENEDETECT / DSH_EDIT_PY, or rely on PATH, or
@@ -45,6 +64,44 @@ def _resolve(env_key: str, name: str, fallback: str | None = None) -> str:
 VENV_SCENEDETECT = _resolve("DSH_SCENEDETECT", "scenedetect")
 FFMPEG = _resolve("DSH_FFMPEG", "ffmpeg")
 FFPROBE = _resolve("DSH_FFPROBE", "ffprobe")
+
+
+# --------------------------------------------------------------------------
+# taste-model bridge
+# --------------------------------------------------------------------------
+def _taste():
+    """Import bin/taste_model.py (sitting next to this file), lazily.
+
+    Lazy on purpose: `inventory`/`features`/`render`/`review_frames`/`revise` and
+    `propose group=1` must keep working on a machine with no numpy at all.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import taste_model  # noqa: PLC0415 — deliberate lazy import
+    return taste_model
+
+
+def _log_jsonl(path: str, record: dict) -> None:
+    """Append one record to an append-only JSONL log (fsynced: the loop's
+    training data must survive a crash mid-session)."""
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _fixture(value: str) -> dict:
+    """A JSON object given either inline or as a path."""
+    if isinstance(value, dict):
+        return value
+    if os.path.exists(value):
+        with open(value, encoding="utf-8") as fh:
+            return json.load(fh)
+    return json.loads(value)
 
 
 # --------------------------------------------------------------------------
@@ -161,15 +218,41 @@ def cmd_features(src: str, inventory: dict) -> dict:
 
 
 # --------------------------------------------------------------------------
-# propose
+# propose (now a GROUP proposal: the candidates GRPO learns to rank)
 # --------------------------------------------------------------------------
-def cmd_propose(inventory: dict, rubric: dict) -> dict:
+# Deterministic candidate grid. Candidate 0 is the rubric verbatim, so group=1
+# reproduces the legacy single-schema proposal. The other candidates trade off
+# target duration and the minimum-shot filter — exactly the v0 scope (pacing +
+# shot selection + tempo) the taste model is allowed to learn. No randomness:
+# the same inventory + rubric always yields the same group.
+CANDIDATE_GRID = [
+    (1.0, 1.0, True, True),     # legacy: rubric verbatim
+    (0.75, 1.0, True, True),    # shorter cut
+    (1.25, 1.0, True, True),    # longer cut
+    (1.0, 0.6, True, True),     # let shorter shots in
+    (1.0, 1.4, True, True),     # stricter minimum shot length
+    (0.6, 1.0, True, True),     # very short cut
+    (1.5, 1.0, True, True),     # very long cut
+    (0.8, 0.7, False, True),    # no short-shot filter: keep everything
+]
+
+
+def _propose_variant(inventory: dict, rubric: dict, target_factor: float,
+                     min_factor: float, skip_short: bool, keep_max: bool) -> dict:
+    """The legacy proposal algorithm, parameterized by the candidate knobs.
+
+    With (1.0, 1.0, True, True) this returns exactly what the old `cmd_propose`
+    returned for the same inventory + rubric.
+    """
     shots = inventory["shots"]
-    min_dur = rubric.get("min_shot_dur", 0.8)
-    max_dur = rubric.get("max_shot_dur")
-    target = rubric.get("target_duration")
+    base_min = rubric.get("min_shot_dur", 0.8)
+    base_max = rubric.get("max_shot_dur")
+    base_target = rubric.get("target_duration")
+    min_dur = base_min * min_factor
+    max_dur = base_max if keep_max else None
+    target = base_target * target_factor if base_target else None
     kept = [s for s in shots
-            if (not rubric.get("skip_short", True) or s["duration"] >= min_dur)
+            if (not skip_short or s["duration"] >= min_dur)
             and (max_dur is None or s["duration"] <= max_dur)]
     if not kept:
         raise RuntimeError("rubric filtered every shot; relax min/max shot duration")
@@ -199,6 +282,95 @@ def cmd_propose(inventory: dict, rubric: dict) -> dict:
             "structure": structure,
             "globals": {"color": None, "audioMix": {}, "music": {"bed": None, "syncToBeat": False},
                         "pace": rubric.get("pace")}}
+
+
+def _grid_for(group: int) -> list:
+    """The deterministic candidate grid, capped at the table size."""
+    n = max(1, min(int(group), len(CANDIDATE_GRID)))
+    return CANDIDATE_GRID[:n]
+
+
+def cmd_propose(inventory: dict, rubric: dict, group: int = 1, identity: str | None = None,
+                style: str | None = None, dataset: str | None = None,
+                clip_id: str | None = None, select: str = "auto",
+                log: bool = True) -> dict:
+    """Propose a group of candidate schemas, select one, and log the group.
+
+    Selection: with an identity, `select=auto|taste` picks the taste-model
+    argmax; otherwise (or with `select=objective`) it picks the best objective
+    reward. Either way `group=1` selects the only candidate, which is the legacy
+    schema.
+    """
+    tm = _taste()
+    grid = _grid_for(group)
+    clip = clip_id or str(inventory.get("source") or "")
+    cands = []
+    for i, (target_factor, min_factor, skip_short, keep_max) in enumerate(grid):
+        schema = _propose_variant(inventory, rubric, target_factor, min_factor,
+                                  skip_short, keep_max)
+        crit = _score_objective(schema, inventory, rubric, None)
+        cands.append({
+            "idx": i, "schema": schema, "critic": crit,
+            "knobs": {"target_factor": target_factor, "min_shot_factor": min_factor,
+                      "skip_short": skip_short, "keep_max": keep_max},
+        })
+
+    scorer = None
+    spec = None
+    if identity:
+        scorer = tm.TasteScorer.load(identity, style)
+        spec = scorer.feature_spec
+    if spec is None:
+        spec = tm.FEATURE_SPEC_VIDEO
+    feats = [tm.features_for(spec, c["schema"], inventory, rubric) for c in cands]
+    scores = scorer.score_many(feats) if scorer else [None] * len(cands)
+
+    if select == "taste" and scorer is None:
+        raise RuntimeError("select=taste requires an identity (--identity / DSH_EDITAPART_IDENTITY)")
+    if scorer is not None and select in ("auto", "taste"):
+        selected = max(range(len(cands)), key=lambda i: scores[i])
+        select_by = "taste"
+    else:
+        selected = max(range(len(cands)), key=lambda i: cands[i]["critic"]["reward"])
+        select_by = "objective" if len(cands) > 1 else "only"
+
+    gid = hashlib.sha1(
+        f"{clip}|{spec}|{[c['knobs'] for c in cands]}|{time.time_ns()}".encode()
+    ).hexdigest()[:12]
+    if dataset and log:
+        _log_jsonl(dataset, {
+            "kind": "group", "group_id": gid, "clip_id": clip,
+            "feature_spec": spec, "created": int(time.time()),
+            "select_by": select_by,
+            "candidates": [{
+                "idx": c["idx"], "knobs": c["knobs"], "features": feats[c["idx"]],
+                "reward_obj": c["critic"]["reward"], "taste_score": scores[c["idx"]],
+                "overall_obj": c["critic"]["overall_score"],
+                "dense_obj": round(sum(e["reward_delta"] for e in c["critic"]["elements"]), 4),
+                "n_segments": len(c["schema"]["structure"]),
+            } for c in cands],
+        })
+
+    chosen = cands[selected]
+    out = {"meta": dict(chosen["schema"]["meta"]), "structure": chosen["schema"]["structure"],
+           "globals": chosen["schema"]["globals"]}
+    out["group"] = {
+        "group_id": gid, "feature_spec": spec, "size": len(cands),
+        "selected": selected, "select_by": select_by, "dataset": dataset,
+        "clip_id": clip,
+        "taste": ({"identity": identity, "scores": [round(s, 6) for s in scores]}
+                  if scorer else None),
+        "candidates": [{
+            "idx": c["idx"], "knobs": c["knobs"],
+            "reward_obj": c["critic"]["reward"],
+            "overall_obj": c["critic"]["overall_score"],
+            "taste_score": (round(scores[c["idx"]], 6) if scores[c["idx"]] is not None else None),
+            "n_segments": len(c["schema"]["structure"]),
+            "duration": round(sum(s["trim"]["out"] - s["trim"]["in"]
+                                  for s in c["schema"]["structure"]), 3),
+        } for c in cands],
+    }
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -333,8 +505,13 @@ def _seg_id(s: dict, idx: int) -> str:
     return f"seg#{idx}"
 
 
-def cmd_critic(schema: dict, inventory: dict, rubric: dict,
-               render_dur: float | None, subjective: float | None) -> dict:
+def _score_objective(schema: dict, inventory: dict, rubric: dict,
+                     subjective: float | None) -> dict:
+    """The objective + dense-delta critic (arithmetic only; no render needed).
+
+    Also the reward source for the taste model: `reward` (= overall + dense) is
+    the dense-shaped reward GRPO group-normalizes.
+    """
     segs = schema.get("structure", [])
     durs = [s["trim"]["out"] - s["trim"]["in"] for s in segs]
     total = sum(durs)
@@ -387,6 +564,32 @@ def cmd_critic(schema: dict, inventory: dict, rubric: dict,
             "revise": [e["shot"] for e in elements if e["decision"] == "drop"][:8]}
 
 
+def cmd_critic(schema: dict, inventory: dict, rubric: dict,
+               render_dur: float | None = None, subjective: float | None = None,
+               dataset: str | None = None, group_id: str | None = None,
+               candidate: int | None = None, chosen_by: str = "critic") -> dict:
+    """Score a schema, and optionally append the outcome to the training log.
+
+    Logging a reward is how the render + vision leg enters GRPO: the group was
+    written by `propose` (with the cheap objective reward), and this refines the
+    selected candidate's reward to the one the real critique produced.
+    """
+    out = _score_objective(schema, inventory, rubric, subjective)
+    if dataset and group_id:
+        idx = int(candidate or 0)
+        _log_jsonl(dataset, {
+            "kind": "reward", "group_id": group_id, "candidate": idx,
+            "chosen_by": chosen_by,
+            "reward": out["reward"], "objective_reward": out["reward"],
+            "overall_obj": out["overall_score"],
+            "dense_obj": round(sum(e["reward_delta"] for e in out["elements"]), 4),
+            "subjective": subjective, "logged_at": int(time.time()),
+        })
+        out["logged"] = {"dataset": dataset, "group_id": group_id, "candidate": idx,
+                         "chosen_by": chosen_by, "reward": out["reward"]}
+    return out
+
+
 # --------------------------------------------------------------------------
 # revise
 # --------------------------------------------------------------------------
@@ -407,6 +610,111 @@ def cmd_revise(schema: dict, critic: dict) -> dict:
     schema["structure"] = kept
     schema["meta"]["revised_by"] = "critic"
     return schema
+
+
+# --------------------------------------------------------------------------
+# taste model: train / score / inspect
+# --------------------------------------------------------------------------
+def cmd_train(dataset: str, identity: str, style: str | None = None,
+              creator: str = "default", epochs: int = 150, lr_muon: float = 0.005,
+              lr_adamw: float = 0.005, temperature: float = 0.5, clip_eps: float = 0.2,
+              entropy_coef: float = 0.01, pref_coef: float = 0.5, lambda_dense: float = 1.0,
+              grad_clip: float = 1.0, inner_steps: int = 1, batch_groups: int = 16,
+              revealed_pref_bonus: float = 1.0,
+              d_h: int | None = None, d_z: int | None = None, seed: int = 0,
+              holdout_every: int = 5, warm_start: bool = True) -> dict:
+    """Fit the shared style-brain + this creator's latent, writing both GGUFs."""
+    tm = _taste()
+    kw: dict = {}
+    if d_h:
+        kw["d_h"] = int(d_h)
+    if d_z:
+        kw["d_z"] = int(d_z)
+    return tm.train(dataset, identity, style=style, creator=creator, epochs=int(epochs),
+                    lr_muon=lr_muon, lr_adamw=lr_adamw, temperature=temperature,
+                    clip_eps=clip_eps, entropy_coef=entropy_coef, pref_coef=pref_coef,
+                    lambda_dense=lambda_dense, grad_clip=grad_clip,
+                    inner_steps=int(inner_steps), batch_groups=int(batch_groups),
+                    revealed_pref_bonus=revealed_pref_bonus,
+                    seed=int(seed),
+                    holdout_every=int(holdout_every),
+                    warm_start=warm_start, **kw)
+
+
+def cmd_taste(identity: str, style: str | None = None,
+              features: str | None = None, schema: str | None = None,
+              inventory: str | None = None, rubric: str | None = None) -> dict:
+    """Score one or more candidate feature dicts with a trained identity."""
+    tm = _taste()
+    scorer = tm.TasteScorer.load(identity, style)
+    if features:
+        payload = _fixture(features)
+        if isinstance(payload, list):
+            return {"scores": scorer.score_many(payload), "feature_spec": scorer.feature_spec,
+                    "n": len(payload)}
+        return {"score": scorer.score_features(payload), "feature_spec": scorer.feature_spec}
+    if not (schema and inventory and rubric):
+        raise RuntimeError("taste needs --features or all of --schema/--inventory/--rubric")
+    feats = tm.features_for(scorer.feature_spec, _fixture(schema), _fixture(inventory),
+                            _fixture(rubric))
+    return {"score": scorer.score_features(feats), "features": feats,
+            "feature_spec": scorer.feature_spec}
+
+
+def cmd_taste_features(schema: str, inventory: str, rubric: str,
+                       spec: str | None = None) -> dict:
+    """The ordered feature vector a schema maps to (layout is in the artifact)."""
+    tm = _taste()
+    use = spec or tm.FEATURE_SPEC_VIDEO
+    feats = tm.features_for(use, _fixture(schema), _fixture(inventory), _fixture(rubric))
+    return {"feature_spec": use, "features": feats, "vector": tm.to_vector(feats, use),
+            "names": tm.FEATURE_SPECS[use]}
+
+
+def cmd_identity_init(identity: str, style: str | None = None, creator: str = "default",
+                      spec: str | None = None) -> dict:
+    """Create a zero-latent identity so a new creator can run the loop at once."""
+    tm = _taste()
+    return tm.init_identity(identity, style=style, creator=creator,
+                            spec=spec or tm.FEATURE_SPEC_VIDEO)
+
+
+def cmd_identity_info(identity: str, style: str | None = None) -> dict:
+    return _taste().TasteScorer.load(identity, style).info()
+
+
+def cmd_taste_status(identity: str | None = None, dataset: str | None = None,
+                     style: str | None = None) -> dict:
+    """One-shot status of the wired-in taste loop: identity + training data."""
+    tm = _taste()
+    out: dict = {"identity": None, "dataset": None}
+    if identity:
+        if os.path.exists(identity):
+            out["identity"] = {**tm.TasteScorer.load(identity, style).info(), "exists": True}
+        else:
+            out["identity"] = {"path": identity, "exists": False,
+                               "hint": "run identity_init (or train) to create it"}
+    if dataset:
+        if os.path.exists(dataset):
+            groups, stats = tm.load_groups(dataset)
+            rewards = [c["reward"] for g in groups for c in g["candidates"]]
+            usable = sum(1 for g in groups
+                         if len(g["candidates"]) >= 2
+                         and g["feature_spec"] in tm.FEATURE_SPECS)
+            out["dataset"] = {
+                **stats, "path": dataset, "exists": True,
+                "groups": len(groups),
+                "candidates": len(rewards),
+                "reward_mean": (round(sum(rewards) / len(rewards), 4) if rewards else None),
+                "reward_min": (round(min(rewards), 4) if rewards else None),
+                "reward_max": (round(max(rewards), 4) if rewards else None),
+                "usable_groups": usable,
+                "ready_to_train": usable > 0,
+            }
+        else:
+            out["dataset"] = {"path": dataset, "exists": False, "groups": 0,
+                              "ready_to_train": False}
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -431,6 +739,14 @@ def main() -> int:
 
     p = sub.add_parser("propose")
     p.add_argument("inventory"); p.add_argument("rubric")
+    p.add_argument("--group", type=int, default=int(os.getenv("DSH_EDITAPART_GROUP", "1")),
+                   help="number of candidate schemas in the group (1 = legacy single schema)")
+    p.add_argument("--identity", default=os.getenv("DSH_EDITAPART_IDENTITY"))
+    p.add_argument("--style", default=os.getenv("DSH_EDITAPART_STYLE"))
+    p.add_argument("--dataset", default=os.getenv("DSH_EDITAPART_DATASET"))
+    p.add_argument("--clip-id", default=None)
+    p.add_argument("--select", choices=["auto", "taste", "objective"], default="auto")
+    p.add_argument("--no-log", action="store_true", help="do not append the group to the dataset")
 
     p = sub.add_parser("render")
     p.add_argument("src"); p.add_argument("schema"); p.add_argument("out")
@@ -443,28 +759,124 @@ def main() -> int:
     p.add_argument("schema"); p.add_argument("inventory"); p.add_argument("rubric")
     p.add_argument("--render-dur", type=float, default=None)
     p.add_argument("--subjective", type=float, default=None)
+    p.add_argument("--dataset", default=os.getenv("DSH_EDITAPART_DATASET"))
+    p.add_argument("--group-id", default=None)
+    p.add_argument("--candidate", type=int, default=0)
+    p.add_argument("--chosen-by", choices=["critic", "creator", "agent", "human"],
+                   default="critic",
+                   help="who picked this candidate: a creator/agent pick is logged "
+                        "as a revealed preference")
 
     p = sub.add_parser("revise")
     p.add_argument("schema"); p.add_argument("critic")
+
+    p = sub.add_parser("train")
+    p.add_argument("--dataset", default=os.getenv("DSH_EDITAPART_DATASET"), required=False)
+    p.add_argument("--identity", default=os.getenv("DSH_EDITAPART_IDENTITY"), required=False)
+    p.add_argument("--style", default=os.getenv("DSH_EDITAPART_STYLE"))
+    p.add_argument("--creator", default=os.getenv("DSH_EDITAPART_CREATOR", "default"))
+    p.add_argument("--epochs", type=int, default=150)
+    p.add_argument("--lr-muon", type=float, default=0.005)
+    p.add_argument("--lr-adamw", type=float, default=0.005)
+    p.add_argument("--temperature", type=float, default=0.5)
+    p.add_argument("--clip-eps", type=float, default=0.2)
+    p.add_argument("--entropy-coef", type=float, default=0.01)
+    p.add_argument("--pref-coef", type=float, default=0.5)
+    p.add_argument("--lambda-dense", type=float, default=1.0)
+    p.add_argument("--d-h", type=int, default=None)
+    p.add_argument("--d-z", type=int, default=None)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--inner-steps", type=int, default=1)
+    p.add_argument("--batch-groups", type=int, default=16)
+    p.add_argument("--revealed-pref-bonus", type=float, default=1.0)
+    p.add_argument("--holdout-every", type=int, default=5)
+    p.add_argument("--no-warm-start", action="store_true")
+
+    p = sub.add_parser("taste")
+    p.add_argument("--identity", default=os.getenv("DSH_EDITAPART_IDENTITY"), required=False)
+    p.add_argument("--style", default=os.getenv("DSH_EDITAPART_STYLE"))
+    p.add_argument("--features", default=None)
+    p.add_argument("--schema", default=None)
+    p.add_argument("--inventory", default=None)
+    p.add_argument("--rubric", default=None)
+
+    p = sub.add_parser("taste_features")
+    p.add_argument("--schema", required=True)
+    p.add_argument("--inventory", required=True)
+    p.add_argument("--rubric", required=True)
+    p.add_argument("--spec", default=None)
+
+    p = sub.add_parser("taste_status")
+    p.add_argument("--identity", default=os.getenv("DSH_EDITAPART_IDENTITY"))
+    p.add_argument("--dataset", default=os.getenv("DSH_EDITAPART_DATASET"))
+    p.add_argument("--style", default=os.getenv("DSH_EDITAPART_STYLE"))
+
+    p = sub.add_parser("identity_init")
+    p.add_argument("--identity", default=os.getenv("DSH_EDITAPART_IDENTITY"), required=False)
+    p.add_argument("--style", default=os.getenv("DSH_EDITAPART_STYLE"))
+    p.add_argument("--creator", default=os.getenv("DSH_EDITAPART_CREATOR", "default"))
+    p.add_argument("--spec", default=None)
+
+    p = sub.add_parser("identity_info")
+    p.add_argument("--identity", default=os.getenv("DSH_EDITAPART_IDENTITY"), required=False)
+    p.add_argument("--style", default=os.getenv("DSH_EDITAPART_STYLE"))
 
     args = ap.parse_args()
     try:
         if args.cmd == "inventory":
             result = cmd_inventory(args.src, args.threshold, args.min_scene_len)
         elif args.cmd == "features":
-            inv = json.loads(args.inventory)
-            result = cmd_features(args.src, inv)
+            result = cmd_features(args.src, json.loads(args.inventory))
         elif args.cmd == "propose":
-            result = cmd_propose(json.loads(args.inventory), json.loads(args.rubric))
+            result = cmd_propose(json.loads(args.inventory), json.loads(args.rubric),
+                                 group=args.group, identity=args.identity, style=args.style,
+                                 dataset=args.dataset, clip_id=args.clip_id,
+                                 select=args.select, log=not args.no_log)
         elif args.cmd == "render":
             result = cmd_render(args.src, json.loads(args.schema), args.out)
         elif args.cmd == "review_frames":
             result = cmd_review_frames(args.src, json.loads(args.schema), args.outdir, args.size)
         elif args.cmd == "critic":
             result = cmd_critic(json.loads(args.schema), json.loads(args.inventory),
-                                json.loads(args.rubric), args.render_dur, args.subjective)
+                                json.loads(args.rubric), args.render_dur, args.subjective,
+                                dataset=args.dataset, group_id=args.group_id,
+                                candidate=args.candidate, chosen_by=args.chosen_by)
         elif args.cmd == "revise":
             result = cmd_revise(json.loads(args.schema), json.loads(args.critic))
+        elif args.cmd == "train":
+            if not args.dataset or not args.identity:
+                raise RuntimeError("train needs --dataset and --identity "
+                                   "(or DSH_EDITAPART_DATASET / DSH_EDITAPART_IDENTITY)")
+            result = cmd_train(args.dataset, args.identity, style=args.style,
+                               creator=args.creator, epochs=args.epochs, lr_muon=args.lr_muon,
+                               lr_adamw=args.lr_adamw, temperature=args.temperature,
+                               clip_eps=args.clip_eps, entropy_coef=args.entropy_coef,
+                               pref_coef=args.pref_coef, lambda_dense=args.lambda_dense,
+                               grad_clip=args.grad_clip, inner_steps=args.inner_steps,
+                               batch_groups=args.batch_groups,
+                               revealed_pref_bonus=args.revealed_pref_bonus,
+                               d_h=args.d_h, d_z=args.d_z, seed=args.seed,
+                               holdout_every=args.holdout_every,
+                               warm_start=not args.no_warm_start)
+        elif args.cmd == "taste":
+            if not args.identity:
+                raise RuntimeError("taste needs --identity (or DSH_EDITAPART_IDENTITY)")
+            result = cmd_taste(args.identity, style=args.style, features=args.features,
+                               schema=args.schema, inventory=args.inventory, rubric=args.rubric)
+        elif args.cmd == "taste_features":
+            result = cmd_taste_features(args.schema, args.inventory, args.rubric, args.spec)
+        elif args.cmd == "taste_status":
+            result = cmd_taste_status(args.identity, args.dataset, args.style)
+        elif args.cmd == "identity_init":
+            if not args.identity:
+                raise RuntimeError("identity_init needs --identity (or DSH_EDITAPART_IDENTITY)")
+            result = cmd_identity_init(args.identity, style=args.style, creator=args.creator,
+                                       spec=args.spec)
+        elif args.cmd == "identity_info":
+            if not args.identity:
+                raise RuntimeError("identity_info needs --identity (or DSH_EDITAPART_IDENTITY)")
+            result = cmd_identity_info(args.identity, style=args.style)
         else:
             ap.error(f"unknown command {args.cmd}")
     except Exception as exc:  # noqa: BLE001 — surfaced to the plugin as a tool error

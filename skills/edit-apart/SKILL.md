@@ -19,9 +19,11 @@ editorial terms and encode every decision in the **EDIT DECISION SCHEMA**,
 which is simultaneously (a) the thing you learn from, (b) the thing you render
 from, and (c) the thing you critique.
 
-The toolchain: `ffmpeg`/`ffprobe` at `/usr/bin`, `scenedetect` CLI via the venv
-at `$HOME/dsh-edit-venv/bin/scenedetect`. If a scenedetect run fails
-because it is not on PATH, use the venv absolute path. Python 3.14.
+The toolchain resolves **env-first, never by a hardcoded absolute path**: the
+matching `DSH_*` variable (`DSH_FFMPEG`, `DSH_FFPROBE`, `DSH_SCENEDETECT`,
+`DSH_EDIT_PY`), then `<preset>/.dshenv`, then PATH. If a run fails because
+`scenedetect` is not on PATH it is installed in a venv, set `DSH_SCENEDETECT`
+(or `source ./env.sh`) — do not hardcode one machine's path into the preset.
 
 ## The loop (always, in this order, bounded)
 

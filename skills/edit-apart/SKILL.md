@@ -53,11 +53,11 @@ matching `DSH_*` variable (`DSH_FFMPEG`, `DSH_FFPROBE`, `DSH_SCENEDETECT`,
    passes); converge or stop.
 
 > **Model capability requirement:** the subjective critic leg reads frames, so
-> the session model must declare image input. The `your session model`
-> model in this environment requires `inputModalities: [text, image]` under
-> `llm-deepseek.models` in `~/.dsh/settings.yaml`; without it, the image gate
-> rejects with "model does not declare image input." If you hit that error,
-> that is a CONFIG gap (declare the modality + restart), not a model limitation.
+> the session model must declare image input. Declare it in your harness's model
+> configuration (the model you run needs `inputModalities` including `image`)
+> and restart; without it the image gate rejects with "model does not declare
+> image input". If you hit that error it is a CONFIG gap in your harness, not a
+> limitation of the model.
 > A **video-in** general model (e.g. GLM-5.3) instead declares
 > `inputModalities: [text, image, video]`; the video capability is per-provider —
 > a provider that does not declare video (e.g. pi-ai) cannot carry it, which is
@@ -140,11 +140,11 @@ engine (`bin/edit_apart_core.py`) is the reference implementation; the tool is i
 facade. Always probe the source first (`ffprobe`) for width/height/fps.
 
 > **Model capability requirement:** the subjective critic leg reads frames, so
-> the session model must declare image input. The `your session model`
-> model in this environment requires `inputModalities: [text, image]` under
-> `llm-deepseek.models` in `~/.dsh/settings.yaml`; without it, the image gate
-> rejects with "model does not declare image input." If you hit that error, that
-> is a CONFIG gap (declare the modality + restart), not a model limitation.
+> the session model must declare image input. Declare it in your harness's model
+> configuration (the model you run needs `inputModalities` including `image`) and
+> restart; without it the image gate rejects with "model does not declare image
+> input". If you hit that error it is a CONFIG gap in your harness, not a
+> limitation of the model.
 
 ## Models: video in / video out
 

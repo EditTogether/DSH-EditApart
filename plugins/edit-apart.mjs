@@ -105,15 +105,18 @@ const jsonText = (obj) => text(JSON.stringify(obj, null, 2))
 const outSchema = { schema: { type: 'object', additionalProperties: true }, render: (a, v) => jsonText(v) }
 
 // --- model routing ---------------------------------------------------------
-// ARCHITECTURE-ONLY AS SHIPPED. To opt in, set DSH_AI_VIDEO_MODEL_PROVIDER and
-// DSH_AI_VIDEO_MODEL to a REGISTERED provider/model that declares `inputModalities`
-// including `video`, then set DSH_AI_VIDEO_MODEL_ROUTE=1 (or remove the guard).
-// Until then this hook is inert and the session uses the default model. It hooks
-// the agent-scoped `agent/request` waterfall to override the general-portion
-// model for THIS agent without changing the global agent-default-model.
+// ARCHITECTURE-ONLY AS SHIPPED, and deliberately without a default: this preset
+// pins no provider and no model. To opt in, set both
+// DSH_AI_VIDEO_MODEL_PROVIDER and DSH_AI_VIDEO_MODEL to a REGISTERED
+// provider/model that declares `inputModalities` including `video`, then set
+// DSH_AI_VIDEO_MODEL_ROUTE=1. A partial opt-in stays inert. Until then this hook
+// does nothing and the session uses the default model. It hooks the agent-scoped
+// `agent/request` waterfall to override the general-portion model for THIS agent
+// without changing the global agent-default-model.
 const PROVIDER = process.env.DSH_AI_VIDEO_MODEL_PROVIDER ?? ''
 const MODEL = process.env.DSH_AI_VIDEO_MODEL ?? ''
 const MODEL_ROUTE_ENABLED = process.env.DSH_AI_VIDEO_MODEL_ROUTE === '1'
+  && PROVIDER !== '' && MODEL !== ''
 
 export function apply(ctx) {
   const tools = [

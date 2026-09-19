@@ -468,7 +468,13 @@ class TestPhotoPerCreatorIdentity(unittest.TestCase):
         cls.train_briefs = [brief(target_luma=0.42 + 0.02 * i, crop=family(i))
                             for i in range(18)]
         cls.neutral = [brief(target_luma=0.46 + 0.01 * i, crop=family(i)) for i in range(10)]
-        cls.ood = [brief(target_luma=0.5, crop=(0.1, 0.1, 0.6, 0.5)) for _ in range(10)]
+        # both eval sets are distinct-input sets (target_luma varies per brief)
+        # DISTINCT target_luma per brief: ten identical briefs would be one
+        # distinct input evaluated ten times, which is not an n of ten and cannot
+        # support a "0/10" style claim. (It still shares ONE unseen crop geometry —
+        # a limitation this suite states rather than hides.)
+        cls.ood = [brief(target_luma=0.44 + 0.02 * i, crop=(0.1, 0.1, 0.6, 0.5))
+                   for i in range(10)]
 
     @classmethod
     def tearDownClass(cls):
@@ -568,7 +574,9 @@ class TestPhotoPerCreatorIdentity(unittest.TestCase):
         in_dist = self._picks(self.neutral)
         ood_diff = sum(1 for x, y in zip(ood["tight"], ood["loose"]) if abs(x - y) > 1e-9)
         in_diff = sum(1 for x, y in zip(in_dist["tight"], in_dist["loose"]) if abs(x - y) > 1e-9)
-        print(f"\n  [out-of-distribution] unseen crop geometry: {len(self.ood)} briefs")
+        print(f"\n  [out-of-distribution] ONE unseen crop geometry, "
+              f"{len(self.ood)} distinct briefs (n_eff = {len(self.ood)}, "
+              f"but only one geometry)")
         print(f"  briefs picked differently: {ood_diff}/{len(self.ood)}")
         print(f"  tight picks: {[round(x, 3) for x in ood['tight']]}")
         print(f"  loose picks: {[round(x, 3) for x in ood['loose']]}")

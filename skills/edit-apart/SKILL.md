@@ -245,14 +245,23 @@ own spatial feature layout. Three consequences you must respect:
   credit inside the tolerance, falloff outside), but the grid is what decides
   whether a group carries signal — check `taste_status` for
   `zero_spread_groups` before blaming a training run.
-- **A photo preference is spatial and does not transfer across crop geometry.**
-  Crop geometry decides which pixels survive, so the crop-area feature is
-  confounded with the content statistics it exposes: creators trained on one
-  brief family separate perfectly on held-out briefs from that family (measured
-  10/10) and not at all on an unseen geometry (0/10). Train on the brief/image
-  family you will use, and treat an out-of-family check as part of accepting a
-  photo identity. **LOOK at the candidate renders** before choosing, and log your
-  choice with `chosen_by=agent` when you override the selected candidate.
+- **A photo preference is spatial, and the SELECTION does not transfer across
+  crop geometry even when the ORDERING does.** Crop geometry decides which pixels
+  survive, so the crop-area feature is confounded with the content statistics it
+  exposes: two creators trained on one family separate 10/10 on held-out briefs
+  from that family, and 0/10 on one unseen geometry (ten distinct briefs), while
+  their crop-area rank correlation stays strongly signed throughout — the other
+  features dominate the argmax. So say which of the two you mean when you claim
+  transfer. A four-arm follow-up found the repair is partial and along the
+  **content** axis: three images with a narrow family transferred to an unseen
+  image and geometry (3/3), both varied-geometry arms did not (0/3), and a
+  no-taste control identity showed the ordering metric's noise floor is ±0.36 —
+  larger than most of those effects. Practical upshot: train on the image/brief
+  family you will use, vary **content** across training groups, and treat an
+  out-of-family check plus a no-taste control as part of accepting a photo
+  identity (`docs/paper-findings.md`, Findings 4c/4d). **LOOK at the candidate
+  renders** before choosing, and log your choice with `chosen_by=agent` when you
+  override the selected candidate.
 
 > **Renderer is NOT a hard dependency.** `bin/photo_core.py` resolves ImageMagick
 > at runtime (`DSH_IMAGEMAGICK` env, then PATH), and a web-profile **in-browser**

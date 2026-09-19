@@ -115,11 +115,23 @@ than video, and all three are measured rather than assumed:
 Measured on a synthetic 1600×1200 image, two creators with opposite framing taste
 (tightest vs loosest crop) sharing one frozen trunk: **10/10 held-out briefs from
 the training family are picked differently, 10/10 in the predicted direction**
-(mean crop area 0.155 vs 0.389). On briefs with an **unseen crop geometry the
-preference does not transfer: 0/10**, because crop geometry determines which
-pixels survive, so the crop-area feature is confounded with the region statistics
-of the content it exposes. Train a photo identity on the brief/image family you
-will use; see `docs/paper-findings.md` (Finding 4).
+(mean crop area 0.155 vs 0.389). On **one unseen crop geometry the selection does
+not transfer: 0/10 over ten distinct briefs** — the crop-area feature is
+confounded with the region statistics of the content the crop exposes. Note the
+split: the *ordering* over crop areas still transfers (rank correlation strongly
+signed at every probe) while the *selection* does not, because other features
+dominate the argmax.
+
+A four-arm follow-up (`tests/experiment_photo_transfer.py`: {1 image, 3 images} ×
+{fixed, varied crop family}, shared probe ladder, matched steps) found the repair
+is partial and along the **content** axis, not the geometry axis: only the
+3-image/narrow-family arm transferred to an unseen image *and* geometry (3/3,
+ratio 0.400), while both varied-geometry arms gave 0/3. A **no-taste control
+identity** showed the ordering metric's noise floor is ±0.36 — larger than most
+effects measured — so treat these results as suggestive, not established.
+`docs/paper-findings.md` Findings 4c/4d has the tables, the power analysis and the
+rules (train on the family you will use; include an out-of-family check and a
+no-taste control).
 
 ## Taste model (wired, measured)
 
@@ -208,7 +220,8 @@ weight is sufficient; the reward override is a robust belt-and-braces addition.
 | Artifacts round-trip | GGUF write→read bit-exact; digest mismatch refused |
 | The identity changes the loop | two creators on the same shared trunk: **12/12** neutral briefs differed, 12/12 in the predicted direction, **24.9s vs 12.0s** mean selected duration |
 | The revealed pick is what carries taste | ablation: **5/12** differing (direction at chance) with no user term in the objective vs **12/12** with it; preference loss alone 12/12, reward override alone 10/12 |
-| Photo taste works, but only in-family | two creators, one shared trunk: **10/10** held-out briefs picked differently (10/10 in direction, crop area 0.155 vs 0.389); on an **unseen crop geometry 0/10** |
+| Photo taste works, but only in-family | two creators, one shared trunk: **10/10** held-out briefs picked differently (10/10 in direction, crop area 0.155 vs 0.389); on **one unseen crop geometry 0/10** over ten distinct briefs (ordering still transfers; the selection does not) |
+| The repair is partial and content-driven | 4-arm transfer experiment: only the 3-image/narrow-family arm transferred to an unseen image+geometry (**3/3**, ratio 0.400) vs **0/3** for both varied-geometry arms; a no-taste control put the metric's noise floor at ±0.36 |
 | The loop is numpy-optional | legacy `propose group=1` and group logging work with numpy blocked; only the model path errors |
 
 Reproduce with `tests/test_taste_model.py` (35 tests, no media needed) and

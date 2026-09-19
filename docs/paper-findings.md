@@ -153,6 +153,70 @@ sensitivity rather than a single number.
 
 ---
 
+## Finding 4 — Static-modality taste: synthesise the missing axis, grade the reward, and do not confound taste with content
+
+Photo (single-image) editing is the harder modality, and for reasons that are
+structural rather than incidental. Three separate effects were measured on the
+wired photo loop.
+
+**4a. With no temporal axis, the spatial structure must be synthesised.**
+Video's layout reads the shot inventory: pacing, shot selection, order, energy.
+A single image has none of that, so the feature layout has to invent spatial
+structure — the crop's geometry (area, aspect deviation, centre deviation,
+distance from the rule-of-thirds points) plus statistics of the *region the crop
+keeps*, taken from a 4×4 region grid computed from the same downscale the global
+inspect already used. Without the region features a crop-preferring creator is
+indistinguishable from a grade-preferring one, because nothing in the vector says
+*where* the crop lands or *what* it keeps.
+
+**4b. A quantised reward makes candidate groups tie, which is exactly zero
+group-relative signal.** The photo critic scored exposure as a threshold
+(`|mean luma − target| ≤ 0.15`). Measured on a 6-candidate group: all six scored
+−0.05, `spread = 0.0`, i.e. the GRPO advantage `A_k = (r_k − mean r)/std r` is
+identically zero for every candidate. This is a reward-design defect that is
+invisible in single-candidate use and fatal for group-relative learning. Grading
+the term — full credit inside the tolerance exactly as before, a linear falloff
+outside it — raised the same group to `spread = 0.47`, and 11/18 training groups
+then carried non-zero spread. The lesson generalises: **before blaming the
+learned policy, check that the reward actually varies across the group.**
+
+**4c. The taste variable is confounded with the content it reveals, so the
+learned preference does not transfer to a new geometry.** This is the finding we
+did not expect. Two creators with opposite framing taste (tightest vs loosest
+crop) were trained on one image across 18 briefs, sharing one frozen trunk:
+
+| Evaluation briefs | Briefs picked differently | In the predicted direction | Mean selected crop area (tight vs loose) |
+| --- | --- | --- | --- |
+| Held-out, same brief/crop family | **10 / 10** | **10 / 10** | **0.155 vs 0.389** |
+| Unseen crop geometry | 0 / 10 | 0 / 10 | 0.450 vs 0.450 (identical) |
+
+Both identities fit their own corpora perfectly (`train_rank_acc = 1.000`) and
+learned the correct sign on the `crop_area` feature weight (−0.22 vs +0.15), yet
+on a new geometry both picked the same candidate. The mechanism is a shortcut:
+crop geometry determines *which pixels survive*, so on any fixed image the
+crop-area feature is correlated with the region statistics (luma, contrast,
+salience) of the content it exposes. A model that can fit both can explain the
+creator's picks through content statistics instead of geometry, and those
+statistics shift as soon as the geometry changes. Training on three images
+instead of one did **not** restore the transfer in our measurement.
+
+This is the structural difference from video. In video, a group varies *which of
+the available material is used* against a shared inventory, so the taste
+variable (selection, duration, order) is exchanged while the content pool stays
+fixed. In a static modality the group varies a *view of one image*, so taste and
+content are entangled inside every group — and group-relative learning cannot
+separate what the group varies from what it shares, because it normalises the
+shared component away and treats the rest as signal.
+
+Practical rule for a preparation-conditioned modality: vary the *conditioning*
+across groups (many images, many crop geometries), not only the knobs within a
+group; otherwise the learned preference is an image-specific shortcut. A
+per-creator photo identity should be reported together with the image/brief
+family it was trained on, and an out-of-family check should be part of its
+acceptance test.
+
+---
+
 ## Threats to validity
 
 - The per-creator preference in the ablations is **simulated** by a deterministic
@@ -167,7 +231,13 @@ sensitivity rather than a single number.
 - The trained policy is the **candidate selector**, not a fine-tuned language
   model: it can only choose among the candidates the engine proposes, so "taste"
   here means "ranking over a fixed reference set", not generation.
-- Photo taste is not covered: the identity is wired into the video loop only.
+- The photo findings come from one synthetic 1600×1200 image (18 training briefs,
+  10 held-out briefs, 8 candidates per group) plus one three-image run; the
+  out-of-distribution result is a single geometry, so the *size* of the transfer
+  gap is not characterised, only its presence.
+- Photo candidates are scored by rendering them, so the group's reward is the
+  renderer's outcome; a different renderer (or an in-browser one) could move the
+  thresholds the graded reward falls back on.
 - Finding 1b is an argument from our own two revisions; we did not systematically
   measure how often such confounded negative ablations occur.
 

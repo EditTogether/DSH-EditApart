@@ -94,6 +94,33 @@ A parallel single-image loop, mounted via the `edit-apart` plugin:
 `video`), and its renderer is **not a hard dependency** (resolved at runtime;
 a web-profile in-browser ImageMagick/ffmpeg may supply it).
 
+The taste model is wired in here too, with its own `photo/v1` layout, its own
+group log and its own style-brain (`style_brain_photo_v1.gguf`), so a creator
+ends up with one identity per modality. Three things make this modality harder
+than video, and all three are measured rather than assumed:
+
+- **No temporal axis to lean on**, so the layout synthesises spatial structure:
+  crop geometry plus statistics of the region the crop *keeps*, read from a 4×4
+  region grid that `photo_inspect` computes from the same downscale as the global
+  stats (the global numbers are unchanged).
+- **Candidate scoring costs a render.** The photo reward is defined on the
+  rendered image, so a K-candidate group is rendered and scored K times
+  (video's objective critic is pure arithmetic). `group=1` with no dataset stays
+  the legacy, render-free proposal.
+- **A quantised reward ties the group.** Exposure was a threshold, so a 6-candidate
+  group scored 6 × −0.05, spread 0.0 — exactly zero group-relative signal. The
+  reward is now graded (full credit inside the tolerance, linear falloff outside),
+  which took that group to spread 0.47 and left 11/18 training groups informative.
+
+Measured on a synthetic 1600×1200 image, two creators with opposite framing taste
+(tightest vs loosest crop) sharing one frozen trunk: **10/10 held-out briefs from
+the training family are picked differently, 10/10 in the predicted direction**
+(mean crop area 0.155 vs 0.389). On briefs with an **unseen crop geometry the
+preference does not transfer: 0/10**, because crop geometry determines which
+pixels survive, so the crop-area feature is confounded with the region statistics
+of the content it exposes. Train a photo identity on the brief/image family you
+will use; see `docs/paper-findings.md` (Finding 4).
+
 ## Taste model (wired, measured)
 
 `bin/taste_model.py` is the per-creator model; `bin/train_identity.py` is its CLI.
@@ -152,6 +179,13 @@ critic_edit schema=<schema> inventory=<inv> rubric=<rub> group_id=<id> \
 taste_status
 train_identity creator=erkin            # writes .editapart/identity.gguf
 train_identity creator=erkin freeze_style=true   # later: only z_u moves
+
+# the photo loop is the same protocol on its own log/identity
+photo_propose src=<img> inspect=<insp> rubric=<rub> group=4
+photo_critic schema=<schema> rubric=<rub> result=<render> group_id=<id> \
+             candidate=<idx> chosen_by=agent
+taste_status modality=photo
+train_identity modality=photo creator=erkin
 ```
 
 `chosen_by=creator|agent` matters: the pick is logged as a **revealed
@@ -174,6 +208,7 @@ weight is sufficient; the reward override is a robust belt-and-braces addition.
 | Artifacts round-trip | GGUF write→read bit-exact; digest mismatch refused |
 | The identity changes the loop | two creators on the same shared trunk: **12/12** neutral briefs differed, 12/12 in the predicted direction, **24.9s vs 12.0s** mean selected duration |
 | The revealed pick is what carries taste | ablation: **5/12** differing (direction at chance) with no user term in the objective vs **12/12** with it; preference loss alone 12/12, reward override alone 10/12 |
+| Photo taste works, but only in-family | two creators, one shared trunk: **10/10** held-out briefs picked differently (10/10 in direction, crop area 0.155 vs 0.389); on an **unseen crop geometry 0/10** |
 | The loop is numpy-optional | legacy `propose group=1` and group logging work with numpy blocked; only the model path errors |
 
 Reproduce with `tests/test_taste_model.py` (35 tests, no media needed) and
@@ -244,11 +279,12 @@ Override keys: `DSH_EDIT_PY`, `DSH_SCENEDETECT`, `DSH_FFMPEG`, `DSH_FFPROBE`,
 `DSH_IMAGEMAGICK`.
 
 Taste-model keys: `DSH_EDITAPART_IDENTITY` (per-creator GGUF),
-`DSH_EDITAPART_DATASET` (group log), `DSH_EDITAPART_DATA` (directory holding both,
-default `<workspace>/.editapart`), `DSH_EDITAPART_STYLE` (shared style-brain path)
-and `DSH_EDITAPART_GROUP` (candidates per proposal, default 4). The identity and
-the log are per-workspace on purpose, so each project accumulates its own
-creator history.
+`DSH_EDITAPART_DATASET` (group log), `DSH_EDITAPART_PHOTO_IDENTITY` /
+`DSH_EDITAPART_PHOTO_DATASET` (the photo loop's own pair),
+`DSH_EDITAPART_DATA` (directory holding them, default `<workspace>/.editapart`),
+`DSH_EDITAPART_STYLE` (shared style-brain path) and `DSH_EDITAPART_GROUP`
+(candidates per proposal, default 4). The identity and the log are per-workspace
+on purpose, so each project accumulates its own creator history.
 
 > The plugin is **import-free** on purpose: a user-preset relative-mounted
 > module cannot import `@deepseek-ai/*` (its internal imports resolve against
@@ -310,12 +346,19 @@ On a synthetic 1800×1200 landscape (`photo.jpg`), rubric = warm punch, saturati
 - Schema: crop → grade → resize.
 - Render: 1200×1000. Critic: overall 0.5, exposure_ok/contrast_ok true,
   reward 0.5, all ops kept; revise kept crop/grade/resize.
+- The exposure/contrast terms are **graded** (see the photo taste section): full
+  credit inside the tolerance exactly as before, linear falloff outside it, so a
+  candidate that passes is scored identically to the pre-grading critic.
 
 ## Verification
 
 ```bash
-# model + loop unit suite: 35 tests, no media required (~25s)
+# model + video loop unit suite: 36 tests, no media required (~25s)
 ~/dsh-edit-venv/bin/python tests/test_taste_model.py -v
+
+# photo taste suite: 23 tests (feature tests need no renderer; the grouped and
+# per-creator tests need ImageMagick; ~4 min, dominated by candidate renders)
+~/dsh-edit-venv/bin/python tests/test_photo_taste.py -v
 
 # end-to-end on real footage (scenedetect + ffmpeg + a real render)
 DSH_EDIT_PY=~/dsh-edit-venv/bin/python \

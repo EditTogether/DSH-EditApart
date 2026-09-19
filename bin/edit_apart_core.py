@@ -695,25 +695,7 @@ def cmd_taste_status(identity: str | None = None, dataset: str | None = None,
             out["identity"] = {"path": identity, "exists": False,
                                "hint": "run identity_init (or train) to create it"}
     if dataset:
-        if os.path.exists(dataset):
-            groups, stats = tm.load_groups(dataset)
-            rewards = [c["reward"] for g in groups for c in g["candidates"]]
-            usable = sum(1 for g in groups
-                         if len(g["candidates"]) >= 2
-                         and g["feature_spec"] in tm.FEATURE_SPECS)
-            out["dataset"] = {
-                **stats, "path": dataset, "exists": True,
-                "groups": len(groups),
-                "candidates": len(rewards),
-                "reward_mean": (round(sum(rewards) / len(rewards), 4) if rewards else None),
-                "reward_min": (round(min(rewards), 4) if rewards else None),
-                "reward_max": (round(max(rewards), 4) if rewards else None),
-                "usable_groups": usable,
-                "ready_to_train": usable > 0,
-            }
-        else:
-            out["dataset"] = {"path": dataset, "exists": False, "groups": 0,
-                              "ready_to_train": False}
+        out["dataset"] = tm.dataset_status(dataset)
     return out
 
 

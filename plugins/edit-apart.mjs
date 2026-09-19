@@ -62,6 +62,18 @@ const STYLE = process.env.DSH_EDITAPART_STYLE || ''
 // creator identity when one exists (otherwise by the objective critic reward).
 const GROUP_DEFAULT = String(process.env.DSH_EDITAPART_GROUP || '4')
 
+// The photo loop keeps its own log and identity: its feature layout is spatial
+// (photo/v1) and its reward is defined on a RENDERED image, so a candidate group
+// there costs one render per candidate. A creator therefore ends up with one
+// identity per modality, each bound to its own style-brain.
+const PHOTO_IDENTITY = process.env.DSH_EDITAPART_PHOTO_IDENTITY || join(DATA_DIR, 'photo_identity.gguf')
+const PHOTO_DATASET = process.env.DSH_EDITAPART_PHOTO_DATASET || join(DATA_DIR, 'photo_samples.jsonl')
+const MODALITY = {
+  video: { core: () => VIDEO_CORE, identity: IDENTITY, dataset: DATASET, train: 'train' },
+  photo: { core: () => PHOTO_CORE, identity: PHOTO_IDENTITY, dataset: PHOTO_DATASET, train: 'taste_train' },
+}
+const pickModality = (v) => (v === 'photo' ? MODALITY.photo : MODALITY.video)
+
 // Run an engine; it emits JSON on stdout and {error} on failure, exit 2 on a
 // caught engine error.
 function runCore(core, args) {
@@ -245,6 +257,7 @@ export function apply(ctx) {
       parameters: {
         type: 'object',
         properties: {
+          modality: { type: 'string', enum: ['video', 'photo'], description: 'Which loop\'s log/identity to train (default video). Photo uses the photo/v1 layout and its own style-brain.' },
           creator: { type: 'string', description: 'Creator name recorded in the artifact. Default "default".' },
           epochs: { type: 'number', description: 'Training epochs (default 150).' },
           freeze_style: { type: 'boolean', description: 'Train ONLY z_u against the frozen shared trunk (the per-creator step; requires an existing style-brain).' },
@@ -255,7 +268,8 @@ export function apply(ctx) {
       },
       output: outSchema,
       execute: (args) => {
-        const argv = ['train', '--dataset', DATASET, '--identity', IDENTITY]
+        const m = pickModality(args.modality)
+        const argv = [m.train, '--dataset', m.dataset, '--identity', m.identity]
         if (STYLE) argv.push('--style', STYLE)
         if (args.creator) argv.push('--creator', String(args.creator))
         if (args.epochs != null) argv.push('--epochs', String(args.epochs))
@@ -263,32 +277,38 @@ export function apply(ctx) {
         if (args.holdout_every != null) argv.push('--holdout-every', String(args.holdout_every))
         if (args.seed != null) argv.push('--seed', String(args.seed))
         if (args.verbose) argv.push('--verbose')
-        return runCore(VIDEO_CORE, argv)
+        return runCore(m.core(), argv)
       },
     },
     {
       name: 'taste_status',
       description: 'Report the state of the wired-in taste loop: whether the per-creator identity exists, how many groups/clips have been logged, how many are trainable, and the reward spread.',
       parameters: { type: 'object', properties: {
-        identity: { type: 'string', description: 'Identity GGUF (default: the workspace identity).' },
-        dataset: { type: 'string', description: 'Group log (default: the workspace log).' },
+        modality: { type: 'string', enum: ['video', 'photo'], description: 'Which loop to report on (default video).' },
+        identity: { type: 'string', description: 'Identity GGUF (default: the workspace identity for that modality).' },
+        dataset: { type: 'string', description: 'Group log (default: the workspace log for that modality).' },
       } },
       output: outSchema,
-      execute: (args) => runCore(VIDEO_CORE, ['taste_status',
-        '--identity', args.identity ?? IDENTITY, '--dataset', args.dataset ?? DATASET]),
+      execute: (args) => {
+        const m = pickModality(args.modality)
+        return runCore(m.core(), ['taste_status', '--identity', args.identity ?? m.identity,
+                                  '--dataset', args.dataset ?? m.dataset])
+      },
     },
     {
       name: 'identity_init',
       description: 'Create a zero-latent per-creator identity bound to a (possibly new) shared style-brain, so a brand-new creator can run the loop immediately and train from zero.',
       parameters: { type: 'object', properties: {
+        modality: { type: 'string', enum: ['video', 'photo'], description: 'Which modality\'s identity to create (default video; photo defaults to the photo/v1 layout).' },
         creator: { type: 'string', description: 'Creator name. Default "default".' },
-        identity: { type: 'string', description: 'Identity GGUF to create (default: the workspace identity).' },
+        identity: { type: 'string', description: 'Identity GGUF to create (default: the workspace identity for that modality).' },
       } },
       output: outSchema,
       execute: (args) => {
-        const argv = ['identity_init', '--identity', args.identity ?? IDENTITY]
+        const m = pickModality(args.modality)
+        const argv = ['identity_init', '--identity', args.identity ?? m.identity]
         if (args.creator) argv.push('--creator', String(args.creator))
-        return runCore(VIDEO_CORE, argv)
+        return runCore(m.core(), argv)
       },
     },
     // ---- photo ----
@@ -305,18 +325,31 @@ export function apply(ctx) {
     },
     {
       name: 'photo_propose',
-      description: 'Propose a photo EDIT DECISION SCHEMA (crop / grade / overlay_text / resize / sharpen) from an inspect result against a rubric (intent, saturation, exposure, crop, width, caption).',
+      description: 'Propose a photo EDIT DECISION SCHEMA (crop / grade / overlay_text / resize / sharpen) from an inspect result against a rubric (intent, saturation, exposure, crop, width, caption). With group>1 it proposes a GROUP of candidates, renders and scores each one (the photo reward is defined on the rendered image), logs the group, and selects the candidate preferred by the per-creator identity when one exists.',
       parameters: {
         type: 'object',
         properties: {
           src: { type: 'string', description: 'Source image path.' },
           inspect: { type: 'string', description: 'photo_inspect JSON (stringified).' },
           rubric: { type: 'string', description: 'Rubric JSON (stringified): intent, saturation, exposure, crop, width, caption.' },
+          group: { type: 'number', description: `Candidates to consider (1 = legacy single schema, no render). Default ${GROUP_DEFAULT}.` },
+          identity: { type: 'string', description: 'Per-creator photo identity GGUF. Default: the workspace photo identity if it exists.' },
+          select: { type: 'string', enum: ['auto', 'taste', 'objective'], description: 'auto (taste if a photo identity exists), taste, or objective.' },
+          no_log: { type: 'boolean', description: 'Do not append this group to the photo training log.' },
         },
         required: ['src', 'inspect', 'rubric'],
       },
       output: outSchema,
-      execute: (args) => runCore(PHOTO_CORE, ['propose', args.src, args.inspect, args.rubric]),
+      execute: (args) => {
+        const argv = ['propose', args.src, args.inspect, args.rubric,
+          '--group', String(args.group ?? GROUP_DEFAULT), '--dataset', PHOTO_DATASET]
+        const identity = args.identity ?? PHOTO_IDENTITY
+        if (identity && existsSync(identity)) argv.push('--identity', identity)
+        if (process.env.DSH_EDITAPART_STYLE) argv.push('--style', process.env.DSH_EDITAPART_STYLE)
+        if (args.select) argv.push('--select', String(args.select))
+        if (args.no_log) argv.push('--no-log')
+        return runCore(PHOTO_CORE, argv)
+      },
     },
     {
       name: 'photo_render',
@@ -343,13 +376,22 @@ export function apply(ctx) {
           rubric: { type: 'string', description: 'Rubric JSON (stringified): target_luma, min_contrast, width.' },
           result: { type: 'string', description: 'Rendered image path to critique.' },
           subjective: { type: 'number', description: '0..1 vision-model judgment to fold in (optional).' },
+          group_id: { type: 'string', description: 'Group id from photo_propose: logs this outcome as the group\'s reward.' },
+          candidate: { type: 'number', description: 'Which candidate of the group this critique is for (default 0).' },
+          chosen_by: { type: 'string', enum: ['critic', 'creator', 'agent'], description: 'Who picked this candidate. A creator/agent pick is logged as a REVEALED preference and becomes the group\'s top reward.' },
         },
         required: ['schema', 'rubric', 'result'],
       },
       output: outSchema,
       execute: (args) => {
-        const sub = args.subjective == null ? [] : ['--subjective', String(args.subjective)]
-        return runCore(PHOTO_CORE, ['critic', args.schema, args.rubric, args.result, ...sub])
+        const argv = ['critic', args.schema, args.rubric, args.result]
+        if (args.subjective != null) argv.push('--subjective', String(args.subjective))
+        if (args.group_id) {
+          argv.push('--dataset', PHOTO_DATASET, '--group-id', String(args.group_id),
+                    '--candidate', String(args.candidate ?? 0),
+                    '--chosen-by', String(args.chosen_by ?? 'critic'))
+        }
+        return runCore(PHOTO_CORE, argv)
       },
     },
     {

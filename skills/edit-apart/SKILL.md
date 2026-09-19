@@ -232,6 +232,28 @@ genuinely subjective residue (does the composition land?) is judged on the
 objective metrics are only a hint. Photo editing stays deterministic: the render
 is ImageMagick, never an AI paint-over.
 
+**Photo taste (`photo/v1`).** The same identity model is wired into the photo
+loop with its own log, its own style-brain (`style_brain_photo_v1.gguf`) and its
+own spatial feature layout. Three consequences you must respect:
+
+- **Scoring a candidate costs a render.** The photo reward is defined on the
+  rendered image, so `photo_propose group=K` renders and scores K candidates.
+  Keep K modest (3–4) unless you need the spread; `group=1` with no dataset is
+  the legacy render-free proposal.
+- **The objective reward is coarse.** Exposure is a tolerance, so near-duplicate
+  candidates tie and a tied group teaches nothing. The reward is graded (full
+  credit inside the tolerance, falloff outside), but the grid is what decides
+  whether a group carries signal — check `taste_status` for
+  `zero_spread_groups` before blaming a training run.
+- **A photo preference is spatial and does not transfer across crop geometry.**
+  Crop geometry decides which pixels survive, so the crop-area feature is
+  confounded with the content statistics it exposes: creators trained on one
+  brief family separate perfectly on held-out briefs from that family (measured
+  10/10) and not at all on an unseen geometry (0/10). Train on the brief/image
+  family you will use, and treat an out-of-family check as part of accepting a
+  photo identity. **LOOK at the candidate renders** before choosing, and log your
+  choice with `chosen_by=agent` when you override the selected candidate.
+
 > **Renderer is NOT a hard dependency.** `bin/photo_core.py` resolves ImageMagick
 > at runtime (`DSH_IMAGEMAGICK` env, then PATH), and a web-profile **in-browser**
 > ImageMagick/ffmpeg (a store plugin) may supply it instead of a local binary.
@@ -342,8 +364,11 @@ The persona and tool catalog already describe them; prefer these over running
   objective winner — that flag is the taste signal.
 - Do not call `train_identity` and then present the artifact as "trained taste"
   without the held-out numbers; report the accuracy or say it is untrained.
-- Do not expect photo taste to be learned yet: the identity is wired into the
-  video loop (pacing/shot selection/tempo). Photo remains rubric-driven.
+- Do not reuse a video identity for photos (or vice versa): the layouts differ
+  (`video/v1` vs `photo/v1`) and each identity is bound to its own style-brain.
+  Use `train_identity modality=photo` / `taste_status modality=photo`.
+- Do not assume a photo preference generalises to a new crop geometry or a new
+  image family — measure it (`docs/paper-findings.md`, Finding 4).
 - Do not present a single-pass guess as a final edit; always critique and
   revise at least once.
 - **Do not rely on the objective heuristic alone.** A steady talking head with a

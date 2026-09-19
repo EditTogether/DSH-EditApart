@@ -85,7 +85,40 @@ VIDEO_FEATURES = [
     "bias",             # constant 1.0
 ]
 
-FEATURE_SPECS = {FEATURE_SPEC_VIDEO: VIDEO_FEATURES}
+FEATURE_SPEC_PHOTO = "photo/v1"
+
+# Photo editing has no temporal axis, so the structure the video layout gets from
+# the shot inventory has to be SYNTHESISED from the image: the crop's geometry,
+# where it lands on a spatial region grid, and what the region it keeps actually
+# looks like. Without those, "composition taste" is not representable at all and
+# a crop-preferring creator is indistinguishable from a grade-preferring one.
+# Region features come from `photo_inspect`'s `regions` grid (see bin/photo_core.py);
+# an inspect result without one degrades to zeros rather than failing.
+PHOTO_FEATURES = [
+    "log_n_ops",        # log1p(#operations) / log1p(8)
+    "has_crop",         # 1.0 if the schema crops
+    "crop_area",        # cropped area / source area
+    "crop_aspect_dev",  # |crop aspect / source aspect - 1|
+    "crop_centre_dev",  # crop-centre distance from the frame centre / half-diagonal
+    "crop_thirds_dist", # crop-centre distance from the nearest rule-of-thirds point
+    "crop_luma",        # mean luma of the region grid inside the crop
+    "crop_contrast",    # (max - min) cell luma inside the crop
+    "crop_sat",         # mean saturation inside the crop
+    "crop_salience",    # max |cell luma - frame mean| inside the crop (subject proxy)
+    "exposure_dev",     # |exposure - 1|
+    "sat_dev",          # |saturation - 1|
+    "contrast_amt",     # |sigmoidal contrast amount|
+    "temp_abs",         # |temperature|
+    "pred_luma_err",    # |crop_luma * exposure - rubric target_luma| (renderer model)
+    "pred_sat_err",     # |crop_sat * saturation - rubric saturation|
+    "sharpen_rel",      # sharpen amount (already relative)
+    "caption_len",      # log1p(len(caption)) / log1p(120)
+    "caption_size_rel", # caption point size / source width
+    "width_ratio",      # output width / source width
+    "bias",             # constant 1.0
+]
+
+FEATURE_SPECS = {FEATURE_SPEC_VIDEO: VIDEO_FEATURES, FEATURE_SPEC_PHOTO: PHOTO_FEATURES}
 
 # Pace bands, identical to the table the objective critic uses. Kept in sync on
 # purpose: a feature must describe the same notion of "in band" the reward uses.
@@ -169,9 +202,150 @@ def features_video(schema: dict, inventory: dict, rubric: dict) -> dict:
     return feats
 
 
+def _photo_ops(schema: dict) -> list[dict]:
+    return [o for o in (schema.get("operations") or []) if isinstance(o, dict)]
+
+
+def _crop_rect(schema: dict, inspect: dict) -> tuple[float, float, float, float]:
+    """The effective crop rect in source pixels (full frame when there is none)."""
+    try:
+        w = float(inspect.get("width") or 0.0)
+        h = float(inspect.get("height") or 0.0)
+    except (TypeError, ValueError):
+        w = h = 0.0
+    for op in _photo_ops(schema):
+        if op.get("op") == "crop":
+            try:
+                cx, cy = float(op.get("x", 0)), float(op.get("y", 0))
+                cw, ch = float(op.get("w", w)), float(op.get("h", h))
+            except (TypeError, ValueError):
+                continue
+            if cw > 0 and ch > 0:
+                if not w or not h:           # no known frame: cannot clamp
+                    return cx, cy, cw, ch
+                cx = _clip(cx, 0.0, max(0.0, w - 1))
+                cy = _clip(cy, 0.0, max(0.0, h - 1))
+                cw = _clip(cw, 1.0, w - cx)
+                ch = _clip(ch, 1.0, h - cy)
+                return cx, cy, cw, ch
+    return 0.0, 0.0, w, h
+
+
+def _region_stats(inspect: dict, rect: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    """Area-weighted region-grid statistics inside `rect`.
+
+    Returns (mean luma, contrast = max-min cell luma, mean saturation, salience =
+    largest |cell luma - frame mean|). Cells outside the frame are ignored; a
+    missing/short grid yields zeros so an older inspect result still works.
+    """
+    regions = inspect.get("regions") or {}
+    cells = regions.get("cells") or []
+    g = int(regions.get("grid") or (len(cells[0]) if cells and isinstance(cells[0], list) else 0))
+    w = float(inspect.get("width") or 0.0)
+    h = float(inspect.get("height") or 0.0)
+    frame_mean = float(inspect.get("mean_luma") or 0.0)
+    if not cells or g <= 0 or not w or not h:
+        return 0.0, 0.0, 0.0, 0.0
+    rx, ry, rw, rh = rect
+    cw, ch = w / g, h / g
+    weight_sum = 0.0
+    luma_sum = sat_sum = 0.0
+    lumas: list[float] = []
+    salience = 0.0
+    for row in range(min(g, len(cells))):
+        for col in range(min(g, len(cells[row]))):
+            cell = cells[row][col] or {}
+            ox = max(0.0, min(rx + rw, (col + 1) * cw) - max(rx, col * cw))
+            oy = max(0.0, min(ry + rh, (row + 1) * ch) - max(ry, row * ch))
+            frac = (ox * oy) / (cw * ch) if cw and ch else 0.0
+            if frac <= 0.0:
+                continue
+            cl = float(cell.get("luma", 0.0) or 0.0)
+            weight_sum += frac
+            luma_sum += frac * cl
+            sat_sum += frac * float(cell.get("sat", 0.0) or 0.0)
+            lumas.append(cl)
+            salience = max(salience, abs(cl - frame_mean))
+    if weight_sum <= 0.0:
+        return 0.0, 0.0, 0.0, 0.0
+    return (luma_sum / weight_sum, (max(lumas) - min(lumas)) if lumas else 0.0,
+            sat_sum / weight_sum, salience)
+
+
+def features_photo(schema: dict, inspect: dict, rubric: dict) -> dict:
+    """Deterministic photo edit-schema features. No renderer, no I/O."""
+    ops = _photo_ops(schema)
+    w = float(inspect.get("width") or 0.0)
+    h = float(inspect.get("height") or 0.0)
+    rect = _crop_rect(schema, inspect)
+    rx, ry, rw, rh = rect
+    src_area = w * h if w and h else 0.0
+    crop_area = (rw * rh / src_area) if src_area else 1.0
+    has_crop = 1.0 if any(o.get("op") == "crop" for o in ops) else 0.0
+    src_aspect = (w / h) if h else 1.0
+    crop_aspect = (rw / rh) if rh else 1.0
+    cx, cy = rx + rw / 2.0, ry + rh / 2.0
+    half_diag = ((w / 2.0) ** 2 + (h / 2.0) ** 2) ** 0.5
+    centre_dev = (((cx - w / 2.0) ** 2 + (cy - h / 2.0) ** 2) ** 0.5 / half_diag) if half_diag else 0.0
+    thirds = [(w * t, h * s) for t in (1 / 3, 2 / 3) for s in (1 / 3, 2 / 3)]
+    thirds_dist = (min(((cx - tx) ** 2 + (cy - ty) ** 2) ** 0.5 for tx, ty in thirds) / half_diag) \
+        if half_diag and thirds else 0.0
+    crop_luma, crop_contrast, crop_sat, crop_salience = _region_stats(inspect, rect)
+
+    exposure = sat = 1.0
+    contrast = temp = sharpen = 0.0
+    caption = ""
+    caption_size = 0.0
+    width_ratio = 1.0
+    for op in ops:
+        kind = op.get("op")
+        if kind == "grade":
+            exposure = float(op.get("exposure", 1.0) or 1.0)
+            sat = float(op.get("saturation", 1.0) or 1.0)
+            contrast = float(op.get("contrast", 0.0) or 0.0)
+            temp = float(op.get("temperature", 0.0) or 0.0)
+        elif kind == "sharpen":
+            sharpen = float(op.get("amount", 0.0) or 0.0)
+        elif kind == "overlay_text":
+            caption = str(op.get("text", "") or "")
+            caption_size = float(op.get("size", 0) or 0)
+        elif kind == "resize":
+            try:
+                width_ratio = (float(op.get("width", w)) / w) if w else 1.0
+            except (TypeError, ValueError):
+                width_ratio = 1.0
+    target_luma = float(rubric.get("target_luma", 0.5) or 0.5)
+    target_sat = float(rubric.get("saturation", 1.0) or 1.0)
+    return {
+        "log_n_ops": _clip(math.log1p(len(ops)) / math.log1p(8.0), 0.0, 1.5),
+        "has_crop": has_crop,
+        "crop_area": _clip(crop_area, 0.0, 1.0),
+        "crop_aspect_dev": _clip(abs(crop_aspect / src_aspect - 1.0) if src_aspect else 0.0, 0.0, 1.5),
+        "crop_centre_dev": _clip(centre_dev, 0.0, 1.5),
+        "crop_thirds_dist": _clip(thirds_dist, 0.0, 1.5),
+        "crop_luma": _clip(crop_luma, 0.0, 1.5),
+        "crop_contrast": _clip(crop_contrast, 0.0, 1.5),
+        "crop_sat": _clip(crop_sat, 0.0, 1.5),
+        "crop_salience": _clip(crop_salience, 0.0, 1.5),
+        "exposure_dev": _clip(abs(exposure - 1.0), 0.0, 1.5),
+        "sat_dev": _clip(abs(sat - 1.0), 0.0, 1.5),
+        "contrast_amt": _clip(abs(contrast), 0.0, 1.5),
+        "temp_abs": _clip(abs(temp), 0.0, 1.5),
+        "pred_luma_err": _clip(abs(crop_luma * exposure - target_luma), 0.0, 1.5),
+        "pred_sat_err": _clip(abs(crop_sat * sat - target_sat), 0.0, 1.5),
+        "sharpen_rel": _clip(sharpen, 0.0, 3.0),
+        "caption_len": _clip(math.log1p(len(caption)) / math.log1p(120.0), 0.0, 1.0),
+        "caption_size_rel": _clip(caption_size / w, 0.0, 0.5) if w else 0.0,
+        "width_ratio": _clip(width_ratio, 0.0, 2.0),
+        "bias": 1.0,
+    }
+
+
 def features_for(spec: str, schema: dict, inventory: dict, rubric: dict) -> dict:
     if spec == FEATURE_SPEC_VIDEO:
         return features_video(schema, inventory, rubric)
+    if spec == FEATURE_SPEC_PHOTO:
+        return features_photo(schema, inventory, rubric)
     raise ValueError(f"unknown feature spec {spec!r} (known: {sorted(FEATURE_SPECS)})")
 
 
@@ -1007,6 +1181,37 @@ def pairwise_agreement(model: StyleBrain, prepared: list[dict]) -> tuple[float, 
                 if (u[i] - u[j]) * (r[i] - r[j]) > 0:
                     agree += 1
     return ((agree / total) if total else 0.0), total
+
+
+def dataset_status(path: str) -> dict:
+    """Group-log summary for `taste_status` (stdlib only, no numpy needed)."""
+    if not os.path.exists(path):
+        return {"path": path, "exists": False, "groups": 0, "ready_to_train": False}
+    groups, stats = load_groups(path)
+    rewards = [c["reward"] for g in groups for c in g["candidates"]]
+    usable = sum(1 for g in groups
+                 if len(g["candidates"]) >= 2 and g["feature_spec"] in FEATURE_SPECS)
+    specs = sorted({g["feature_spec"] for g in groups})
+    spreads = []
+    for g in groups:
+        rs = [c["reward"] for c in g["candidates"]]
+        if len(rs) > 1:
+            spreads.append(max(rs) - min(rs))
+    return {
+        "path": path, "exists": True, "groups": len(groups), "usable_groups": usable,
+        "ready_to_train": usable > 0, "feature_specs": specs,
+        "candidates": len(rewards),
+        "reward_mean": (round(sum(rewards) / len(rewards), 4) if rewards else None),
+        "reward_min": (round(min(rewards), 4) if rewards else None),
+        "reward_max": (round(max(rewards), 4) if rewards else None),
+        # A tie means the group carried no group-relative signal at all; for the
+        # photo loop this is the quantity that shows whether the objective reward
+        # is too coarse to discriminate the candidate grid.
+        "zero_spread_groups": sum(1 for s_ in spreads if s_ <= 0),
+        "scored_groups": len(spreads),
+        **{k: v for k, v in stats.items() if k in
+           ("records", "legacy_singletons", "reward_records", "bad_lines")},
+    }
 
 
 def ranking_accuracy(model: StyleBrain, prepared: list[dict]) -> tuple[float, int]:

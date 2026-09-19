@@ -244,19 +244,57 @@ Reproduce with `tests/test_taste_model.py` (35 tests, no media needed) and
   a normal run trains the trunk too and is meant for building the shared model
   from the union of several creators' logs.
 
+## Install
+
+An EditApart install is one directory in the harness's user-preset root. **The
+directory name is the preset id**, `agent.cordis.yml` is the composition the
+loader owns, and `preset.yml` carries display metadata only — so clone the
+repository under the id you want:
+
+```bash
+git clone https://github.com/EditTogether/DSH-EditApart.git ~/.dsh/.agent-presets/ai-video-editor
+```
+
+Optionally provision the scene-detector/renderer toolchain (a venv, so nothing
+touches your system Python):
+
+```bash
+cd ~/.dsh/.agent-presets/ai-video-editor && bash setup.sh
+```
+
+Restart DeepSeek Harness (or open a new session) and pick **EditApart (AI taste
+editor)** in the mode picker. Update with
+`git -C ~/.dsh/.agent-presets/ai-video-editor pull`; uninstall by deleting that
+directory.
+
+**Requirements.** The harness you install it into — the composition names only
+plugins the harness already ships, so there are no npm dependencies to add — plus
+`ffmpeg`/`ffprobe` and `scenedetect` for video, and optionally ImageMagick for
+photos. No absolute path is baked in anywhere: toolchains resolve `DSH_*` env →
+`<preset>/.dshenv` → PATH, so a machine-local install is a `.dshenv` (gitignored)
+and never a repository edit.
+
+**Verified as installed.** Running the harness's own preset discovery against a
+plain `git clone` of this repository reports id `ai-video-editor`, name
+"EditApart (AI taste editor)", and **no `broken` verdict** — every plugin row in
+the composition resolves against the runtime's package base. Both files must stay
+at the repository root: a directory whose `agent.cordis.yml` is missing still
+occupies its id and shows as broken rather than mounting.
+
+This project is discoverable in the DeepSeek Harness ecosystem under the
+[`dsh-plugin`](https://github.com/topics/dsh-plugin) topic.
+
 ## How to use it
 
-1. Provision the toolchain (see **Portable install** below) or make sure
-   `ffmpeg`/`scenedetect` are on PATH.
-2. Start a session on this preset (select `ai-video-editor` / EditApart in the
+1. Start a session on this preset (select `ai-video-editor` / EditApart in the
    mode picker). The preset mounts its own `edit-apart` plugin, so the tools
    `inventory`, `features`, `propose_schema`, `render_schema`,
    `review_frames`, `critic_edit`, `revise_schema`, `train_identity`,
    `taste_status`, `identity_init`, `photo_inspect`, `photo_propose`,
    `photo_render`, `photo_critic`, and `photo_revise` appear in that session's
    catalog.
-3. The bundled `edit-apart` skill drives the loop.
-4. Toolchains are **resolved at runtime, not hard-locked**: `ffmpeg`/`ffprobe`/
+2. The bundled `edit-apart` skill drives the loop.
+3. Toolchains are **resolved at runtime, not hard-locked**: `ffmpeg`/`ffprobe`/
    `scenedetect`/Python (video) and ImageMagick (photo) come from the matching
    `DSH_*` env ( `DSH_FFMPEG`, `DSH_FFPROBE`, `DSH_SCENEDETECT`, `DSH_EDIT_PY`,
    `DSH_IMAGEMAGICK`), then `.dshenv`, then PATH. A web-profile **in-browser**

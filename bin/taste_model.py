@@ -605,7 +605,7 @@ class StyleBrain:
 
     # ---- forward / backward ------------------------------------------------
     def _trunk(self, X: "np.ndarray", z: "np.ndarray", cache: dict | None = None):
-        """h1 -> FiLM(z) -> tanh -> bounded scalar utility.
+        """h1 -> FiLM(z) -> latent-gated activations -> linear ranking score.
 
         The utility is an UNBOUNDED ranking score. It is deliberately not
         squashed: a `tanh` output saturates under the group-relative margin

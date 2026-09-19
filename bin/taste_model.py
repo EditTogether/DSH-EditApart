@@ -964,13 +964,14 @@ def build_training_arrays(path: str, lambda_dense: float = 1.0,
                 rewards.append(c["reward"])
         r = np.array(rewards, dtype=np.float64)
         # A logged CREATOR (or agent) pick is a revealed preference, not just
-        # another critic score. Without this the objective critic reward — which
-        # is rubric-driven and identical across creators — dominates the
-        # group-relative update and every creator converges to the same edit set
-        # (measured: two identities picked identically on 10/10 neutral briefs).
-        # The bonus makes the revealed pick the group's best reward, so the same
-        # GRPO objective learns the creator's own choice among rubric-equivalent
-        # candidates instead of fighting it.
+        # another critic score. A rubric-derived reward cannot identify per-user
+        # taste — the objective has to carry a user-dependent term. The aux
+        # preference loss does most of the work here; the bonus additionally makes
+        # the revealed pick the group's best reward, so the group-relative
+        # advantage agrees with the creator's choice and the dense critic shaping
+        # stays interpretable. Ablation (12 neutral briefs, two opposite tastes):
+        # no preference term 5/12 differing (direction at chance); preference loss
+        # alone 12/12; reward override alone 10/12. See docs/paper-findings.md.
         chosen = g.get("chosen")
         chosen_by = g.get("chosen_by")
         if (chosen is not None and 0 <= chosen < len(r)

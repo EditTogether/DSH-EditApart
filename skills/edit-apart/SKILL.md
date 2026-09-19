@@ -262,12 +262,15 @@ fine-tuned language model.
   step (this is what `propose_schema group=K` + `train_identity` do for real).
   Interleave **self-play** (the deterministic candidate grid) with **history**
   (the creator's logged prior edits).
-- **Revealed preference beats the heuristic.** When the creator or the agent
+- **Revealed preference must be in the objective.** When the creator or the agent
   renders a candidate that is *not* the one the objective reward prefers, log
   `critic_edit … chosen_by=creator|agent`. That pick becomes the group's top
-  reward. Without it the rubric-driven reward dominates and every creator
-  converges to the same edits — measured: two creators picked identically on
-  12/12 neutral briefs.
+  reward and a preference term in the loss. A rubric-derived reward alone cannot
+  identify per-user taste: with no user-dependent term, two creators with
+  opposite tastes separate on only **5/12** neutral briefs (direction at chance),
+  versus **12/12 in the predicted direction** with it. The preference loss at the
+  default weight suffices; the reward override alone is weaker (10/12), so keep
+  both.
 - **Muon's lr is in spectral-norm units** — on this small trunk it must be ~10×
   below an Adam lr (`0.005`), otherwise it oversteps and stops fitting
   (training accuracy stalls near 0.5 instead of ~0.85).

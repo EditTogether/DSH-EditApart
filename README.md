@@ -154,10 +154,14 @@ train_identity creator=erkin            # writes .editapart/identity.gguf
 train_identity creator=erkin freeze_style=true   # later: only z_u moves
 ```
 
-`chosen_by=creator|agent` matters: a pick that overrides the objective ranking is
-logged as a **revealed preference** and becomes that group's top reward. Without
-it the rubric-driven critic reward dominates and creators converge to identical
-edits (measured: two creators picked identically on 12/12 briefs).
+`chosen_by=creator|agent` matters: the pick is logged as a **revealed
+preference**, becomes that group's top reward, and — more importantly — gives the
+trainer a preference term. A rubric-derived reward alone cannot identify per-user
+taste: with no user-dependent term in the objective, two creators with opposite
+tastes separate on only **5/12** neutral briefs (direction at chance), versus
+**12/12 in the predicted direction** once the revealed pick is in the objective
+(24.9 s vs 12.0 s mean selected duration). The preference loss at the default
+weight is sufficient; the reward override is a robust belt-and-braces addition.
 
 ### Measured results
 
@@ -169,6 +173,7 @@ edits (measured: two creators picked identically on 12/12 briefs).
 | Optimizer split holds | Muon touches 2D only, AdamW 1D only (asserted, with witnesses) |
 | Artifacts round-trip | GGUF write→read bit-exact; digest mismatch refused |
 | The identity changes the loop | two creators on the same shared trunk: **12/12** neutral briefs differed, 12/12 in the predicted direction, **24.9s vs 12.0s** mean selected duration |
+| The revealed pick is what carries taste | ablation: **5/12** differing (direction at chance) with no user term in the objective vs **12/12** with it; preference loss alone 12/12, reward override alone 10/12 |
 | The loop is numpy-optional | legacy `propose group=1` and group logging work with numpy blocked; only the model path errors |
 
 Reproduce with `tests/test_taste_model.py` (35 tests, no media needed) and

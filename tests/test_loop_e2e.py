@@ -9,9 +9,10 @@ editor, or still a side program?":
      group of rubric-equivalent candidates is proposed, the "long-take" creator
      renders the longest candidate and the "short-take" creator the shortest.
      The critic's dense reward is logged for the rendered pick, and the pick is
-     logged with `chosen_by="creator"` so it enters training as a REVEALED
-     preference (without that flag the rubric-driven objective reward dominates
-     and both creators converge to the same edits),
+     logged with `chosen_by="creator"` so it enters the objective as a REVEALED
+     preference — a rubric-derived reward alone cannot identify per-user taste
+     (ablation: 5/12 briefs differing with the direction at chance, versus 12/12
+     with the preference term; see docs/paper-findings.md),
   3. train ONE shared style-brain on the union, then train each creator's
      identity with `freeze_style=True` (only `z_u` moves; the trunk is shared),
   4. ask both identities to edit the SAME neutral brief and compare what the loop

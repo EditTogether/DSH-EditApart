@@ -251,13 +251,13 @@ own spatial feature layout. Three consequences you must respect:
   crop geometry even when the ORDERING does.** Crop geometry decides which pixels
   survive, so the crop-area feature is confounded with the content statistics it
   exposes: two creators trained on one family separate 10/10 on held-out briefs
-  from that family, and 0/10 on one unseen geometry (ten distinct briefs), while
-  their crop-area rank correlation stays strongly signed throughout — the other
-  features dominate the argmax. So say which of the two you mean when you claim
-  transfer. A four-arm follow-up found the repair is partial and along the
-  **content** axis: three images with a narrow family transferred to an unseen
-  image and geometry (3/3), both varied-geometry arms did not (0/3), and a
-  no-taste control identity showed the ordering metric's noise floor is ±0.36 —
+  from that family, and 10/10 on one unseen geometry (ten distinct briefs) but
+  with a **smaller margin** (mean crop area 0.30 vs 0.45, against 0.155 vs 0.389
+  in-family) — the confound narrows the effect rather than erasing it. A four-arm
+  follow-up found the repair is partial and along the **content** axis: three
+  images with a narrow family transferred to an unseen image and geometry
+  (tight/loose ratio 0.400) while the other arms showed no effect there; a
+  no-taste control identity showed the ordering metric's noise floor is ±0.36,
   larger than most of those effects. Practical upshot: train on the image/brief
   family you will use, vary **content** across training groups, and treat an
   out-of-family check plus a no-taste control as part of accepting a photo
@@ -300,10 +300,11 @@ fine-tuned language model.
   `critic_edit … chosen_by=creator|agent`. That pick becomes the group's top
   reward and a preference term in the loss. A rubric-derived reward alone cannot
   identify per-user taste: with no user-dependent term, two creators with
-  opposite tastes separate on only **5/12** neutral briefs (direction at chance),
-  versus **12/12 in the predicted direction** with it. The preference loss at the
-  default weight suffices; the reward override alone is weaker (10/12), so keep
-  both.
+  opposite tastes differ on only **4/12** neutral briefs (p ≈ 0.21 against the
+  unrelated-picks null), versus **8/12** (p ≈ 0.0006) with it. The reward override
+  fits the creator's own corpus far better than the auxiliary loss (0.83/1.00 vs
+  0.22/0.26) and widens the margin, so keep both — and note that these numbers
+  were re-measured after the GRPO ratio baseline was corrected.
 - **Muon's lr is in spectral-norm units** — on this small trunk it must be ~10×
   below an Adam lr (`0.005`), otherwise it oversteps and stops fitting
   (training accuracy stalls near 0.5 instead of ~0.85).
@@ -363,6 +364,14 @@ The persona and tool catalog already describe them; prefer these over running
 - If a render command fails, read the ffmpeg error and fix the **graph**, not
   the schema, unless the schema is genuinely invalid.
 - Keep the loop bounded; report convergence or the final pass's score honestly.
+- **If groups look degenerate, check the environment before blaming the model.**
+  A mis-resolved toolchain can silently zero a whole feature family (an
+  ImageMagick 6 `convert` asked for dimensions used to return 0x0, which killed
+  every crop). Both cores ship a conformance check:
+  `python bin/photo_core.py selftest` and `python bin/edit_apart_core.py selftest`
+  — they assert non-degenerate dimensions, a non-degenerate region grid, distinct
+  candidate crops, and a real render. `taste_status`'s `zero_spread_groups` and
+  `unscored_candidates` tell you the same thing about an existing log.
 
 ## Do NOT
 

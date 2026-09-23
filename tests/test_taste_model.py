@@ -187,6 +187,94 @@ class TestGradients(unittest.TestCase):
         self.assertLess(worst, 1e-6, f"worst relative gradient error {worst:.3e}")
 
 
+class TestObjectiveFidelity(unittest.TestCase):
+    """The GRPO ratio must be a ratio.
+
+    A review found `train()` storing raw standardised logits as the ratio
+    baseline, so `rho = exp(log_softmax(s) - s) = 1/Z` — a per-group constant.
+    Consequences: every negative-advantage candidate fell into the clipped branch
+    and its downward gradient became independent of |A| (a -0.1 and a -8.0 pushed
+    down identically), and the reported `clip_fraction` was a per-call sum divided
+    by the batch count (5.9, i.e. 590%). These tests pin the corrected behaviour.
+    """
+
+    def _group(self, A, k=None):
+        model = tm.StyleBrain(6, 6, 4, seed=0)
+        X = np.array([[1.0, 0, 0, 0, 0, 1], [0, 1.0, 0, 0, 0, 1], [0, 0, 1.0, 0, 0, 1]])
+        if k is not None:
+            X = X[:k]
+        s = tm.policy_logits(model, X, 0.5)["s"]
+        return model, X, s, np.asarray(A, dtype=float)
+
+    def test_baseline_must_be_log_probabilities(self):
+        model, X, s, A = self._group([1.0, 0.0, -1.0])
+        got = {}
+        for label, old in (("log_probs", [tm.log_softmax(s)]), ("raw_logits", [s])):
+            du = []
+            tm.grpo_loss_and_grads(model, [{"X": X, "A": A, "chosen": None}], old,
+                                   temperature=0.5, entropy_coef=0.0, pref_coef=0.0,
+                                   utility_grads_out=du)
+            got[label] = du[0]
+        # log-probs: rho == 1, so the objective keeps a real magnitude
+        self.assertGreater(abs(got["log_probs"][2]), 1.0)
+        # raw logits: rho == 1/Z, the gradient collapses by ~the group size
+        self.assertLess(abs(got["raw_logits"][2]), abs(got["log_probs"][2]) / 50)
+
+    def test_negative_advantage_scales_with_magnitude(self):
+        """A -2.0 advantage must push its candidate down harder than a -0.1 one.
+
+        With the raw-logit baseline both were frozen at the same value
+        (measured 0.026815 for -0.1, -2.0 AND -8.0), i.e. the objective had
+        degenerated to positive-only REINFORCE.
+        """
+        pushes = {}
+        for label, m in (("weak", 0.1), ("strong", 2.0)):
+            model, X, s, _ = self._group([1.0, 0.0, -m])
+            A = np.array([1.0, 0.0, -m])
+            du = []
+            tm.grpo_loss_and_grads(model, [{"X": X, "A": A, "chosen": None}],
+                                   [tm.log_softmax(s)], temperature=0.5,
+                                   entropy_coef=0.0, pref_coef=0.0, utility_grads_out=du)
+            pushes[label] = du[0][2]
+            self.assertGreater(pushes[label], 0.0, "negative advantage must push down")
+        self.assertGreater(pushes["strong"], 5 * pushes["weak"],
+                           f"downward push did not scale with |A|: {pushes}")
+
+    def test_positive_advantage_pushes_up(self):
+        model, X, s, A = self._group([1.0, 0.0, -1.0])
+        du = []
+        tm.grpo_loss_and_grads(model, [{"X": X, "A": A, "chosen": None}],
+                               [tm.log_softmax(s)], temperature=0.5, entropy_coef=0.0,
+                               pref_coef=0.0, utility_grads_out=du)
+        self.assertLess(du[0][0], 0.0, "positive advantage must raise its utility")
+
+    def test_two_candidate_groups_carry_no_gradient(self):
+        """Documented limitation of group standardisation: for K=2 the standardised
+        logits are exactly +-1/T whatever the utilities are, so the objective is
+        constant in them and the group teaches nothing. Use group >= 3."""
+        model, X, s, A = self._group([1.0, -1.0], k=2)
+        du = []
+        tm.grpo_loss_and_grads(model, [{"X": X, "A": A, "chosen": None}],
+                               [tm.log_softmax(s)], temperature=0.5, entropy_coef=0.0,
+                               pref_coef=0.0, utility_grads_out=du)
+        self.assertLess(float(np.abs(du[0]).max()), 1e-5)
+
+    def test_reported_ratio_telemetry_is_a_real_fraction(self):
+        with tempfile.TemporaryDirectory() as d:
+            ds = os.path.join(d, "s.jsonl")
+            synthetic_dataset(ds, n_clips=30, k=5, seed=0)
+            m = tm.train(ds, os.path.join(d, "i.gguf"), creator="c", epochs=1,
+                         warm_start=False)
+            h = m["history"][-1]
+            self.assertGreaterEqual(h["clip_fraction"], 0.0)
+            self.assertLessEqual(h["clip_fraction"], 1.0,
+                                 "clip_fraction must be a fraction, not a per-batch sum")
+            self.assertLess(abs(h["mean_abs_rho_minus_1"]), 1e-9,
+                            "a frozen baseline must give rho == 1")
+            self.assertAlmostEqual(h["groups"], 1.0, places=6,
+                                   msg="one group per objective call")
+
+
 class TestGGUF(unittest.TestCase):
     def test_round_trip_bit_exact(self):
         with tempfile.TemporaryDirectory() as d:
@@ -292,6 +380,33 @@ class TestDatasetFolding(unittest.TestCase):
             prepared2, _ = tm.build_training_arrays(path, lambda_dense=2.0)
             g1b = next(p for p in prepared2 if p["group_id"] == "g1")
             self.assertAlmostEqual(float(g1b["rewards"][0]), 0.5 - 0.5, places=6)
+
+    def test_null_rewards_do_not_crash_and_are_skipped(self):
+        """The photo engine writes `"reward_obj": null` for unscored candidates.
+        `float(None)` used to abort taste_status/train on the whole file."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "null.jsonl")
+            with open(path, "w", encoding="utf-8") as fh:
+                # a group with NO scored candidates
+                fh.write(json.dumps({"kind": "group", "group_id": "allnull",
+                                     "feature_spec": tm.FEATURE_SPEC_PHOTO,
+                                     "candidates": [
+                                         {"features": {"crop_area": 0.3}, "reward_obj": None},
+                                         {"features": {"crop_area": 0.2}, "reward_obj": None}]}) + "\n")
+                # a group with one scored candidate and one null
+                fh.write(json.dumps({"kind": "group", "group_id": "partial",
+                                     "feature_spec": tm.FEATURE_SPEC_PHOTO,
+                                     "candidates": [
+                                         {"features": {"crop_area": 0.3}, "reward_obj": 0.5},
+                                         {"features": {"crop_area": 0.2}, "reward_obj": None}]}) + "\n")
+            groups, stats = tm.load_groups(path)          # must not raise
+            self.assertEqual(len(groups), 2)
+            prepared, pstats = tm.build_training_arrays(path)
+            self.assertEqual(pstats.get("candidates_unscored"), 3)
+            self.assertEqual(len(prepared), 0,
+                             "groups without enough scored candidates teach nothing")
+            status = tm.dataset_status(path)              # must not raise either
+            self.assertTrue(status["exists"])
 
     def test_hard_broken_record_is_counted_not_fatal(self):
         with tempfile.TemporaryDirectory() as d:

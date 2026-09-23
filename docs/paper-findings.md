@@ -36,29 +36,47 @@ style-brain trunk, identical briefs, twelve held-out neutral briefs. The
 revealed pick is logged either way; the arms differ in what the trainer does
 with it:
 
-| Arm | Preference signal in the objective | Briefs picked differently | In the predicted direction | Mean selected duration (long vs short) |
-| --- | --- | --- | --- | --- |
-| A | none (`pref=0`, no override) | 5 / 12 | 5 / 12 ≈ chance | 20.35 s vs 16.48 s |
-| B1 | preference loss, default weight | **12 / 12** | **12 / 12** | **24.94 s vs 11.97 s** |
-| B2 | preference loss, weight ×4 | 12 / 12 | 12 / 12 | 24.94 s vs 11.97 s |
-| C1 | reward override only | 10 / 12 | 10 / 12 | 23.64 s vs 14.06 s |
-| C2 | override + preference loss | 12 / 12 | 12 / 12 | 24.94 s vs 11.97 s |
+| Arm | Preference signal in the objective | Briefs picked differently | In the predicted direction | Mean duration (long vs short) | Training fit (long / short) |
+| --- | --- | --- | --- | --- | --- |
+| A | none (`pref=0`, no override) | 4 / 12 | 4 / 12 (p ≈ 0.21) | 17.54 s vs 13.90 s | 0.33 / 0.35 |
+| B1 | preference loss, default weight | 8 / 12 | **8 / 12 (p ≈ 0.0006)** | 19.66 s vs 12.68 s | 0.22 / 0.26 |
+| B2 | preference loss, weight ×4 | 8 / 12 | **8 / 12** | 20.12 s vs 11.97 s | 0.28 / 0.09 |
+| C1 | reward override only | 8 / 12 | **8 / 12** | 21.39 s vs 11.97 s | 0.83 / 1.00 |
+| C2 | override + preference loss | 8 / 12 | **8 / 12** | 21.39 s vs 11.97 s | 0.83 / 1.00 |
+
+Chance here is not 0.5: with no taste the two identities select the *same*
+candidate, so "picked differently" has a null of ~0, and the direction rate under
+unrelated-but-symmetric picks is ≈ 0.20. The p-values above are one-sided
+binomial tails against 0.203.
 
 Three things worth reporting:
 
-1. **Without any user-dependent term the direction is at chance** (5/12), even
-   though the two latents are trained on reward vectors that differ slightly
-   (the logged objective reward of the candidate the user picked replaces that
-   index). Logging *which* candidate the user chose therefore leaks a weak
-   signal on its own — 5/12 differing — but not a usable direction. The
-   "revealed choice" record is necessary; it is not sufficient.
-2. **The preference loss is sufficient and saturates at a smaller weight than we
-   first used** (B1 = B2 = 12/12), so the recipe is simply "put the user's choice
-   in the objective", not "tune a preference weight".
-3. **The reward override is also sufficient but weaker alone** (C1 = 10/12), and
-   adds nothing on top of the preference loss (C2 = B1). We keep it because it is
-   robust to a badly-scaled preference weight and it makes the group's top reward
-   agree with the user's pick, which keeps the dense critic shaping interpretable.
+1. **The presence of a user-dependent term is what moves the outcome.** Without one
+   the direction rate is 4/12 (p ≈ 0.21, i.e. indistinguishable from unrelated
+   picks); with one it is 8/12 (p ≈ 0.0006) for every mechanism tried. That is the
+   finding: taste is unidentifiable from a rubric-derived reward, and the user's
+   revealed choice has to be *in the objective*.
+2. **How it enters matters for the strength of the effect, not for whether it
+   works.** The margins differ by a factor of ~2.5 (A +3.6 s, B1 +7.0 s, B2
+   +8.2 s, C1/C2 +9.4 s), and so does the ability to fit the creator's own corpus:
+   the reward override reaches 0.83/1.00 training ranking accuracy while the
+   auxiliary preference loss alone stalls at 0.22–0.28. A reward that is *itself*
+   made correct gives the group-relative advantage a clean signal; an auxiliary
+   loss competes with a term that already points elsewhere.
+3. **The reward override is still a fixed point**: C2 (override + loss) is
+   indistinguishable from C1 (override alone) on every measured quantity, so the
+   loss is harmless but redundant once the reward carries the preference.
+
+> **Correction (2026-09).** An earlier version of this table reported A = 5/12,
+> B1/B2 = 12/12 and C1 = 10/12, concluding that the preference loss alone was
+> sufficient and the override redundant. Those numbers were produced by a GRPO
+> ratio baseline that stored raw logits instead of log-probabilities, so
+> `rho = 1/Z` was a per-group constant and negative advantages lost their direct
+> gradient. The table above is a full re-measurement on the corrected objective
+> (`tests/experiment_revealed_preference.py`); the conclusion moved from "how it
+> enters does not matter" to "how it enters changes the effect size", and the
+> headline claim — the user's choice must be a term in the objective — is
+> unchanged.
 
 **Generalisation beyond this system.** Any rubric- or instruction-conditioned RL
 loop that wants per-user (or per-cohort) adaptation must ensure the objective
@@ -83,6 +101,16 @@ the preference loss alone now separates the creators perfectly (B1), and the
 override is redundant (C1 < B1). The corrected claim is the weaker, more useful
 one.
 
+**A third instance, and the point of this subsection.** The corrected table above
+reversed the 1b correction itself. After the adapter could express the preference,
+the ablation said "the preference loss alone suffices, the override is redundant";
+with the objective defect fixed it says "every mechanism separates, but the
+override produces a 2.5× larger margin and a corpus fit the loss cannot reach".
+The ablation's *conclusion* changed twice, each time immediately after a defect in
+the same system was fixed — first a capacity defect, then an objective/telemetry
+defect. That is the pattern this subsection is about, observed twice on one
+question.
+
 **Lesson.** A "signal X is insufficient" ablation is only as trustworthy as the
 model's ability to *express* X. When the mechanism under test is a gradient path,
 an unidentifiable-parameter result and a vanished-gradient result are
@@ -90,7 +118,11 @@ observationally identical — both look like "the model ignored the signal". Any
 such negative result should be re-run after the capacity/optimisation defects
 found in the same system are fixed, and the ablation should be reported together
 with the capacity conditions it was measured under. We would have published a
-false claim about the learning rule had we not re-run it.
+false claim about the learning rule had we not re-run it, and then a second false
+claim had we not re-run it again after the ratio fix. **A defect found elsewhere
+in the stack invalidates every ablation that touched its code path** — the
+re-measurement burden is a property of the system, not of the individual
+experiment.
 
 ---
 
@@ -188,7 +220,7 @@ crop) were trained on one image across 18 briefs, sharing one frozen trunk:
 | Evaluation briefs | Briefs picked differently | In the predicted direction | Mean selected crop area (tight vs loose) |
 | --- | --- | --- | --- |
 | Held-out, same brief/crop family | **10 / 10** | **10 / 10** | **0.155 vs 0.389** |
-| ONE unseen crop geometry | 0 / 10 | 0 / 10 | 0.450 vs 0.450 (identical) |
+| ONE unseen crop geometry | **10 / 10** | **10 / 10** | 0.300 vs 0.450 (gap 0.150 vs 0.233) |
 
 Both identities fit their own corpora perfectly (`train_rank_acc = 1.000`). The
 mechanism is a shortcut: crop geometry determines *which pixels survive*, so on
@@ -201,20 +233,23 @@ revealed picks (the proposal is deterministic given image + rubric), so its
 crop-area preference cancels and the taste can only be carried by the per-creator
 latent `z_u` — the confound is a property of the adapter, not of the trunk.
 
-Two corrections to how this was first stated, both from a read-only review:
+Corrections to how this was first stated, from two read-only reviews and the
+objective fix:
 
 - **The `0 / 10` row was n = 1, not n = 10.** The ten evaluation briefs were ten
   *identical* briefs, so they were one distinct input evaluated ten times. The
-  suite now varies the conditioning per brief (`target_luma`), and the result
-  survives: **0 / 10 over ten distinct briefs**, still on a single geometry.
-- **The ordering transfers even where the selection does not.** Measured over the
-  same identities: the rank correlation between `z_u`-driven scores and candidate
-  crop areas is strongly signed at every probe (separation
-  `tau_loose − tau_tight` ≈ 0.2–1.5 against a chance of 0), while the *argmax
-  selection* shows no separation on the unseen geometry. So "the preference does
-  not transfer" is true of the **decision**, not of the learned **ordering**: the
-  other features dominate the argmax. Transfer claims must say which of the two
-  they are about.
+  suite now varies the conditioning per brief (`target_luma`); on the corrected
+  objective the row reads **10 / 10 over ten distinct briefs**.
+- **The "no transfer" result was an artifact of a broken objective.** It was
+  measured while the GRPO ratio baseline stored raw logits, so negative advantages
+  had no direct gradient. With that fixed the selection transfers to the unseen
+  geometry as well — with a gap of 0.150 against 0.233 in-distribution. The
+  confound below therefore *narrows* the effect rather than erasing it.
+- **An intermediate reading — "the ordering transfers while the selection does
+  not" — is also superseded.** It was true of the pre-fix models; with the
+  corrected objective both transfer on this probe (the ordering still with a
+  larger relative margin). It was a real observation about a specific pair of
+  models, not a property to build on.
 
 This is the structural difference from video. In video, a group varies *which of
 the available material is used* against a shared inventory, so the taste
@@ -238,31 +273,38 @@ Behavioural result — mean selected crop-area ratio tight/loose (< 1 means the
 tight-taste identity framed tighter; the in-family/seen-image cell is the
 manipulation check):
 
-| Arm (training) | in_family | near | mid | far | in_family, unseen image | far, unseen image |
+| Arm (training) | in_family (seen) | near (seen) | mid (seen) | far (seen) | in_family (unseen img) | far (unseen img) |
 | --- | --- | --- | --- | --- | --- | --- |
-| A1 1 image, fixed | 0.222 (3/3) | 1.000 | 0.732 | 1.000 | 1.000 (0/3) | 1.000 (0/3) |
-| A2 1 image, varied | 0.222 (3/3) | 0.401 | 0.400 | 0.400 | 0.461 (1/3) | 1.000 (0/3) |
-| B1 3 images, fixed | 0.222 (3/3) | 0.667 | 1.000 | 1.250 | **0.222 (3/3)** | **0.400 (3/3)** |
-| B2 3 images, varied | 0.222 (3/3) | 1.000 | 1.000 | 0.400 | 0.300 (2/3) | 1.000 (0/3) |
+| A1 1 image, fixed | 0.222 | 0.601 | 0.400 | 0.789 | 0.555 | 1.000 |
+| A2 1 image, varied | 0.222 | 1.000 | 1.000 | 0.667 | 0.222 | 1.000 |
+| B1 3 images, fixed | 0.222 | 0.401 | 0.400 | 0.789 | 0.222 | **0.400** |
+| B2 3 images, varied | 0.222 | 1.000 | 1.000 | 0.400 | 0.222 | 1.000 |
+
+(ratio of mean selected crop area, tight/loose; 1.000 = no effect, < 1 = the
+tight-taste identity framed tighter. Re-measured on the corrected objective with
+`--no-control`, 3 distinct briefs per cell.)
 
 Read honestly:
 
 1. **The manipulation works**: with an in-family geometry on a trained image,
    every arm separates the two creators 3/3 at ratio 0.222.
-2. **Exactly one cell shows full transfer**: B1 — three images with the *narrow*
-   geometry family — separates 3/3 on an **unseen image and an unseen geometry**
-   (ratio 0.400). The pre-registered hypothesis was that widening the geometry
-   family would repair transfer; **that is not what happened.** A2 and B2 (varied
-   geometry) show 0/3 at the same probe, and A2's per-creator `crop_area` weight
-   is ≈0 (−0.02/+0.07), i.e. the varied family made the crop preference *harder*
-   to express, not easier.
+2. **Exactly one cell shows full transfer, and it is the same one as before the
+   objective fix**: B1 — three images with the *narrow* geometry family —
+   separates on an **unseen image and an unseen geometry** (ratio 0.400), while
+   A1, A2 and B2 show no effect there (1.000). The pre-registered hypothesis was
+   that widening the geometry family would repair transfer; **that is not what
+   happened.** Nor is it a content-only story any more: on a *seen* image the far
+   probe separates for three of four arms (0.789/0.667/0.789/0.400), so what the
+   unseen *image* costs depends on the arm.
 3. **The ordering metric at this effect size is not trustworthy, and a control
    showed it.** A taste-irrelevant identity (always picks the same candidate
    index, so it carries no crop-area rule) still reaches `|tau| = 0.20–0.36` on
    crop areas. Every `far`/`mid` separation we measured (0.07–0.51) sits inside
    that band; only the in-family separations (0.62–1.49) clearly exceed it. The
    control is what stops us from reporting several "repairs" that were metric
-   noise.
+   noise. (The control was not re-run in the post-fix pass above — the noise
+   floor is a property of the metric on this data, but it is a pre-fix
+   measurement and is flagged as such.)
 4. **n = 3 distinct briefs per cell, one seed, one unseen image.** B1's 3/3 is
    suggestive of "content diversity forces a geometry rule", not established;
    and B1's own `far` cell on a *seen* image goes the other way (ratio 1.250),
@@ -286,6 +328,28 @@ axis that actually varies what the group shares (content here), and verify it
 with a probe ladder rather than a single held-out point.
 
 ---
+
+## Corrections log
+
+Every entry is a defect found after publication of an earlier draft of these
+findings, and what changed as a result. Kept in the paper deliberately: the
+sequence is the methodological finding.
+
+| # | Defect | Consequence | Fixed by |
+| --- | --- | --- | --- |
+| 1 | The revealed-preference claim ("only a reward override works") | Measured while the adapter could not express the preference; reversed once capacity was fixed (Finding 1b) | Finding 2's group-standardised logits + three latent injection points |
+| 2 | `n = 1` presented as `n = 10` (ten identical briefs) | The photo out-of-family result overstated its evidence | Distinct `target_luma` per evaluation brief |
+| 3 | **The GRPO ratio used raw logits, not log-probabilities** | `rho = 1/Z` was a per-group constant: negative advantages lost their direct gradient (identical 0.0268 for A = −0.1, −2.0, −8.0), and `clip_fraction` was a per-batch sum (5.9) | Store `log_softmax(...)`; separate the per-call and per-step denominators; `TestObjectiveFidelity` pins both |
+| 4 | ImageMagick 6: `convert identify` returned 0×0 **silently** | The photo crop axis — the whole spatial feature family — was dead on IM6 while every step reported success | Resolve `identify` separately, make a dimension failure loud, refuse degenerate groups, add `selftest` |
+| 5 | A render hard-required audio on every input; `loudnorm` on digital silence emits NaN | Muted screen recordings / GIF-sourced clips could not be rendered at all | Per-input audio probing + `anullsrc`; skip `loudnorm` when no input has audio |
+| 6 | `"reward_obj": null` aborted the whole training log | `taste_status`/`train` failed on any log containing an unscored group | None-safe folding; unscored candidates are skipped and counted |
+| 7 | The video E2E critiqued the selected schema while labelling the reward with `--candidate <pick>` | The logged reward for a revealed pick was the wrong candidate's | Candidate schemas exposed in the group metadata; the test asserts reward identity |
+
+Findings 1, 4c and 4d were re-measured after entry 3, since all three were
+computed on the code path that entry fixed. Finding 2's ablation (0/12 → 12/12)
+was measured before it: both of its arms ran under the same objective, so the
+*relative* conclusion stands, but its exact counts are not re-earned. Finding 3
+(Muon lr) is an optimiser-scale measurement and is likewise pre-fix.
 
 ## Threats to validity
 

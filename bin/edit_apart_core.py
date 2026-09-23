@@ -35,7 +35,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -94,6 +96,40 @@ def _log_jsonl(path: str, record: dict) -> None:
         os.fsync(fh.fileno())
 
 
+def _num(value, field: str, lo: float | None = None, hi: float | None = None) -> float:
+    """Validate one schema value that is interpolated into the ffmpeg filtergraph.
+
+    A filtergraph cannot execute commands, but it CAN be broken or side-channelled
+    by a value carrying `,`/`;`/`=` or a filter reference (`movie=`, `zmq`,
+    `sendcmd`). Schemas here are model-authored, so a malformed field used to
+    either crash the render with an opaque ffmpeg error or splice arbitrary filter
+    text into the graph. Every value that reaches the graph goes through here.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"schema field {field!r} must be a number, got {value!r}")
+    if not math.isfinite(f):
+        raise RuntimeError(f"schema field {field!r} must be a finite number, got {value!r}")
+    if lo is not None and f < lo:
+        raise RuntimeError(f"schema field {field!r}={f} is below the minimum {lo}")
+    if hi is not None and f > hi:
+        raise RuntimeError(f"schema field {field!r}={f} is above the maximum {hi}")
+    return f
+
+
+_FF_CROP_RE = re.compile(r"^-?\d{1,5}:-?\d{1,5}:-?\d{1,5}:-?\d{1,5}$")
+
+
+def _ff_crop(value) -> str:
+    """A crop geometry string, validated (w:h:x:y, integers only)."""
+    text = str(value)
+    if not _FF_CROP_RE.match(text):
+        raise RuntimeError(
+            f"schema field 'transform.crop' must be 'w:h:x:y' with integers, got {value!r}")
+    return text
+
+
 def _fixture(value: str) -> dict:
     """A JSON object given either inline or as a path."""
     if isinstance(value, dict):
@@ -110,6 +146,13 @@ def _fixture(value: str) -> dict:
 def cmd_inventory(src: str, threshold: float, min_scene_len: float) -> dict:
     """scenedetect cut detection -> shot list (0.7.1 syntax)."""
     out_dir = temp_dir()
+    try:
+        return _inventory_from(src, threshold, min_scene_len, out_dir)
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def _inventory_from(src: str, threshold: float, min_scene_len: float, out_dir: str) -> dict:
     out_file = os.path.join(out_dir, "_sd_scenes.csv")
     r = subprocess.run(
         [VENV_SCENEDETECT, "-i", src, "detect-content",
@@ -368,6 +411,12 @@ def cmd_propose(inventory: dict, rubric: dict, group: int = 1, identity: str | N
             "n_segments": len(c["schema"]["structure"]),
             "duration": round(sum(s["trim"]["out"] - s["trim"]["in"]
                                   for s in c["schema"]["structure"]), 3),
+            # The candidate's OWN schema, so a caller can render (and critique) a
+            # different candidate than the one selected — the workflow the skill
+            # asks for when the agent or creator overrides the selection. Without
+            # it, a caller critiquing "the picked candidate" can only pass the
+            # selected schema and silently mislabel the reward.
+            "schema": c["schema"],
         } for c in cands],
     }
     return out
@@ -382,6 +431,19 @@ def _probe(src: str) -> dict:
                         "-of", "json", src], capture_output=True, text=True)
     data = json.loads(r.stdout)
     return next((s for s in data["streams"] if s["codec_type"] == "video"), {})
+
+
+def _has_audio(src: str) -> bool:
+    """Whether an input carries an audio stream at all.
+
+    The renderer used to map `[i:a]` unconditionally, so ONE input without audio
+    (a muted screen recording, a GIF-sourced clip, a camera dump) failed the whole
+    ffmpeg invocation with "Stream specifier 'a' matched no streams".
+    """
+    r = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "a",
+                        "-show_entries", "stream=codec_type", "-of", "csv=p=0", src],
+                       capture_output=True, text=True)
+    return bool(r.stdout.strip())
 
 
 def cmd_render(src: str, schema: dict, out: str) -> dict:
@@ -408,50 +470,82 @@ def cmd_render(src: str, schema: dict, out: str) -> dict:
 
     v_filter: list[str] = []
     in_labels: list[str] = []
+    used_inputs: set[int] = set()
     for i, seg in enumerate(segs):
         s = src_index(seg)
-        t_in, t_out = seg["trim"]["in"], seg["trim"]["out"]
+        used_inputs.add(s)
+        trim = seg.get("trim") or {}
+        if "in" not in trim or "out" not in trim:
+            raise RuntimeError(f"segment {i} has no trim {{in,out}} — the renderer needs both")
+        t_in = _num(trim["in"], f"structure[{i}].trim.in", 0.0, 10 ** 6)
+        t_out = _num(trim["out"], f"structure[{i}].trim.out", 0.0, 10 ** 6)
+        if t_out <= t_in:
+            raise RuntimeError(f"segment {i} has trim.out ({t_out}) <= trim.in ({t_in})")
         parts = ["trim=" + f"start={t_in:g}:end={t_out:g}", "setpts=PTS-STARTPTS"]
         retime = seg.get("retime", 0.0)
         if retime not in (0.0, None):
-            parts.append(f"setpts=PTS/{retime:g}")
+            parts.append(f"setpts=PTS/{_num(retime, f'structure[{i}].retime', 0.01, 100.0):g}")
         tf = seg.get("transform") or {}
-        scale = tf.get("scale", 1.0)
-        if scale and scale != 1.0:
+        scale = _num(tf.get("scale", 1.0), f"structure[{i}].transform.scale", 0.01, 20.0)
+        if scale != 1.0:
             parts.append(f"scale=iw*{scale:g}:ih*{scale:g}")
         crop = tf.get("crop")
         if crop:
-            parts.append(f"crop={crop}")
+            parts.append(f"crop={_ff_crop(crop)}")
         grade = seg.get("grade") or {}
         eq = grade.get("eq") or {}
-        eqopts = [f"{k}={eq[k]}" for k in ("brightness", "contrast", "saturation", "gamma") if k in eq]
+        eqopts = [f"{k}={_num(eq[k], f'structure[{i}].grade.eq.{k}'):g}"
+                  for k in ("brightness", "contrast", "saturation", "gamma") if k in eq]
         if eqopts:
             parts.append("eq=" + ":".join(eqopts))
         v_filter.append(f"[{s}:v]" + ",".join(parts) + f",format=yuv420p[v{i}]")
         in_labels.append(f"[v{i}]")
     concat_v = "".join(in_labels) + f"concat=n={len(segs)}:v=1:a=0[outv]"
 
+    # Audio presence must be probed AFTER generated assets are registered above,
+    # and only for the inputs the segments actually reference.
+    audio_ok = {i: _has_audio(inputs[i]) for i in sorted(used_inputs)}
+    any_audio = any(audio_ok.values())
     a_filter: list[str] = []
     a_labels: list[str] = []
-    for i, seg in enumerate(segs):
-        s = src_index(seg)
-        t_in, t_out = seg["trim"]["in"], seg["trim"]["out"]
-        adur = t_out - t_in
-        a = f"[{s}:a]" + f"atrim=start={t_in:g}:end={t_out:g},asetpts=PTS-STARTPTS"
-        au = seg.get("audio") or {}
-        lvl = au.get("level", 1.0)
-        if lvl and lvl != 1.0:
-            a += f",volume={lvl:g}"
-        fade = au.get("fade", 0.0)
-        if fade:
-            a += f",afade=t=in:st=0:d={fade:g},afade=t=out:st={max(0, adur - fade):g}:d={fade:g}"
-        a += f"[a{i}]"
-        a_filter.append(a)
-        a_labels.append(f"[a{i}]")
-    if a_labels:
+    if any_audio:
+        for i, seg in enumerate(segs):
+            s = src_index(seg)
+            trim = seg.get("trim") or {}
+            t_in = _num(trim["in"], f"structure[{i}].trim.in", 0.0, 10 ** 6)
+            t_out = _num(trim["out"], f"structure[{i}].trim.out", 0.0, 10 ** 6)
+            adur = t_out - t_in
+            if audio_ok.get(s):
+                a = f"[{s}:a]" + f"atrim=start={t_in:g}:end={t_out:g},asetpts=PTS-STARTPTS"
+            else:
+                # No audio on THIS input (muted screen recording, GIF-sourced clip,
+                # camera dump): synthesize silence for the segment rather than
+                # failing the whole render on "Stream specifier 'a' matched no streams".
+                a = (f"anullsrc=channel_layout=stereo:sample_rate=48000,"
+                     f"atrim=start=0:end={max(0.05, adur):g},asetpts=PTS-STARTPTS")
+            au = seg.get("audio") or {}
+            lvl = _num(au.get("level", 1.0), f"structure[{i}].audio.level", 0.0, 100.0)
+            if lvl != 1.0:
+                a += f",volume={lvl:g}"
+            fade = _num(au.get("fade", 0.0), f"structure[{i}].audio.fade", 0.0, 10 ** 6)
+            if fade:
+                a += f",afade=t=in:st=0:d={fade:g},afade=t=out:st={max(0, adur - fade):g}:d={fade:g}"
+            a += f"[a{i}]"
+            a_filter.append(a)
+            a_labels.append(f"[a{i}]")
         a_chain = "".join(a_labels) + f"concat=n={len(a_labels)}:v=0:a=1,loudnorm[aout]"
     else:
-        a_chain = "anullsrc=channel_layout=stereo:sample_rate=48000[aout]"
+        # NO input carries audio at all. Emit one silent track of the total length
+        # and deliberately skip loudnorm: single-pass loudnorm on digital silence
+        # divides by zero energy and hands the AAC encoder NaN, which failed the
+        # render with "Input contains (near) NaN/+-Inf".
+        total = 0.0
+        for i, seg in enumerate(segs):
+            trim = seg.get("trim") or {}
+            total += (_num(trim["out"], f"structure[{i}].trim.out", 0.0, 10 ** 6)
+                      - _num(trim["in"], f"structure[{i}].trim.in", 0.0, 10 ** 6))
+        a_chain = (f"anullsrc=channel_layout=stereo:sample_rate=48000,"
+                   f"atrim=start=0:end={max(0.05, total):g},asetpts=PTS-STARTPTS[aout]")
     fc = ";".join(v_filter + [concat_v]) + ";" + ";".join(a_filter + [a_chain])
 
     input_args: list[str] = []
@@ -462,7 +556,9 @@ def cmd_render(src: str, schema: dict, out: str) -> dict:
            "veryfast", "-crf", "20", "-c:a", "aac", "-movflags", "+faststart", out]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError(f"ffmpeg render failed: {r.stderr[:400]}")
+        # The BANNER is the first ~400 chars; the actual error is the last line.
+        tail = "\n".join((r.stderr or "").strip().splitlines()[-3:]) or "(no stderr)"
+        raise RuntimeError(f"ffmpeg render failed: {tail}")
     return {"out": out, "duration": _probe(out).get("duration")}
 
 
@@ -608,7 +704,7 @@ def cmd_revise(schema: dict, critic: dict) -> dict:
         t += d
         s["timeline"]["out"] = round(t, 3)
     schema["structure"] = kept
-    schema["meta"]["revised_by"] = "critic"
+    schema.setdefault("meta", {})["revised_by"] = "critic"
     return schema
 
 
@@ -700,6 +796,55 @@ def cmd_taste_status(identity: str | None = None, dataset: str | None = None,
 
 
 # --------------------------------------------------------------------------
+# selftest (environment conformance)
+# --------------------------------------------------------------------------
+def cmd_selftest() -> dict:
+    """Prove this install can run the video loop end to end on a fixture.
+
+    Guards the class of defect where a mis-resolved toolchain silently degrades a
+    feature axis instead of failing: inventory must find shots, features must be
+    non-degenerate, and a one-segment schema must render to a real file.
+    """
+    import tempfile
+    d = tempfile.mkdtemp(prefix="dshe_selftest_")
+    try:
+        clip = os.path.join(d, "fixture.mp4")
+        r = subprocess.run([FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i",
+                            "testsrc=size=320x240:rate=10", "-t", "3",
+                            "-pix_fmt", "yuv420p", clip], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"ffmpeg cannot synthesize a fixture: {r.stderr.strip()[-200:]}")
+        inv = cmd_inventory(clip, 27.0, 0.6)
+        if not inv["shots"]:
+            raise RuntimeError("inventory found no shots in a synthetic clip")
+        inv = cmd_features(clip, inv)
+        feats = [s.get("features", {}) for s in inv["shots"]]
+        motions = [f.get("motion", 0.0) for f in feats]
+        if not any(m > 0 for m in motions):
+            raise RuntimeError("every shot reports zero motion — features are degenerate")
+        schema = {"meta": {"source": clip}, "structure": [{
+            "shot": inv["shots"][0]["shot"],
+            "trim": {"in": 0.0, "out": 1.0}, "retime": 0.0,
+            "timeline": {"in": 0.0, "out": 1.0},
+            "transition": {"type": "cut", "dur": 0.0, "params": {}},
+            "transform": {"scale": 1.0, "crop": None, "position": None},
+            "grade": {"lut": None, "eq": {}},
+            "audio": {"level": 1.0, "duck": 0.0, "fade": 0.0}, "overlay": [], "why": "selftest"}],
+            "globals": {"color": None, "audioMix": {}, "music": {"bed": None, "syncToBeat": False},
+                        "pace": None}}
+        out = os.path.join(d, "rendered.mp4")
+        rendered = cmd_render(clip, schema, out)
+        if not os.path.exists(out) or os.path.getsize(out) == 0:
+            raise RuntimeError("the renderer produced no output file")
+        return {"ok": True, "ffmpeg": FFMPEG, "ffprobe": FFPROBE,
+                "scenedetect": VENV_SCENEDETECT, "shots": len(inv["shots"]),
+                "mean_motion": round(sum(motions) / len(motions), 3),
+                "rendered_duration": rendered.get("duration")}
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
 # dispatch
 # --------------------------------------------------------------------------
 def temp_dir() -> str:
@@ -775,6 +920,7 @@ def main() -> int:
     p.add_argument("--holdout-every", type=int, default=5)
     p.add_argument("--no-warm-start", action="store_true")
 
+    sub.add_parser("selftest", help="check this install's toolchain end to end")
     p = sub.add_parser("taste")
     p.add_argument("--identity", default=os.getenv("DSH_EDITAPART_IDENTITY"), required=False)
     p.add_argument("--style", default=os.getenv("DSH_EDITAPART_STYLE"))
@@ -841,6 +987,8 @@ def main() -> int:
                                d_h=args.d_h, d_z=args.d_z, seed=args.seed,
                                holdout_every=args.holdout_every,
                                warm_start=not args.no_warm_start)
+        elif args.cmd == "selftest":
+            result = cmd_selftest()
         elif args.cmd == "taste":
             if not args.identity:
                 raise RuntimeError("taste needs --identity (or DSH_EDITAPART_IDENTITY)")

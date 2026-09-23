@@ -49,6 +49,14 @@ def engine(*args) -> dict:
     return json.loads(r.stdout)
 
 
+def engine_env(env: dict, *args) -> dict:
+    """Run the engine with a custom environment (toolchain overrides)."""
+    r = subprocess.run([PY, PHOTO_CORE, *args], capture_output=True, text=True, env=env)
+    if r.returncode != 0:
+        raise RuntimeError(f"photo engine {args[0]} failed: {r.stdout} {r.stderr}")
+    return json.loads(r.stdout)
+
+
 def make_image(path: str) -> str:
     """A deterministic image with real spatial structure: a bright highlight
     upper-right, a dark block lower-left, a mid band, and a warm block lower-right.
@@ -202,6 +210,99 @@ class TestPhotoFeatures(unittest.TestCase):
         self.assertEqual(sorted(f), sorted(tm.PHOTO_FEATURES))
         with self.assertRaises(ValueError):
             tm.features_for("photo/v9", {"operations": []}, self.inspect, brief())
+
+
+@unittest.skipUnless(HAVE_MAGICK, "ImageMagick not available")
+class TestImageMagickCompatibility(unittest.TestCase):
+    """ImageMagick 6 ships `convert` (renderer) and `identify` (prober) as two
+    binaries, and `convert identify …` is not a thing. Resolving only `convert`
+    and asking it for dimensions used to return 0x0 SILENTLY, which turned every
+    percent crop into `0x0+0+0` and zeroed the whole spatial feature axis while
+    every downstream step still reported success."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="photoim_")
+        cls.img = make_image(os.path.join(cls.tmp, "synthetic.png"))
+        cls.inspect = engine("inspect", cls.img)
+        cls.rubric = brief()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_identify_prefix_is_not_a_convert_subcommand(self):
+        original = pc.MAGICK
+        try:
+            pc.MAGICK = "/usr/bin/convert"          # IM6-style renderer
+            prefix = pc._identify_prefix()
+        finally:
+            pc.MAGICK = original
+        self.assertNotEqual(prefix, ["/usr/bin/convert", "identify"])
+        self.assertEqual(os.path.basename(prefix[0]), "identify")
+
+    def test_identify_prefix_uses_the_magick_subcommand_on_im7(self):
+        original = pc.MAGICK
+        try:
+            pc.MAGICK = "/usr/bin/magick"
+            prefix = pc._identify_prefix()
+        finally:
+            pc.MAGICK = original
+        self.assertEqual(prefix, ["/usr/bin/magick", "identify"])
+
+    @unittest.skipUnless(os.path.exists("/usr/bin/convert"), "no IM6-style convert binary")
+    def test_inspect_returns_real_dimensions_with_a_convert_only_renderer(self):
+        env = dict(os.environ, DSH_IMAGEMAGICK="/usr/bin/convert")
+        env.pop("DSH_IDENTIFY", None)
+        out = engine_env(env, "inspect", self.img)
+        self.assertGreater(out["width"], 0, "0x0 dims silently degenerate every crop")
+        self.assertGreater(out["height"], 0)
+        self.assertEqual(out["width"], 1600)
+
+    def test_dimension_failure_is_loud_not_zero(self):
+        env = dict(os.environ, DSH_IMAGEMAGICK=MAGICK, DSH_IDENTIFY="/bin/false")
+        r = subprocess.run([PY, PHOTO_CORE, "inspect", self.img],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 2, "a broken prober must not pass silently")
+        self.assertIn("dimensions", json.loads(r.stdout)["error"])
+
+    def test_propose_refuses_a_dimension_less_inspect(self):
+        blind = {**self.inspect, "width": 0, "height": 0}
+        with self.assertRaises(RuntimeError) as cm:
+            pc.cmd_propose(self.img, blind, self.rubric)
+        self.assertIn("dimensions", str(cm.exception))
+
+    def test_selftest_reports_a_working_environment(self):
+        out = engine("selftest")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["dims"], "600x400")
+        self.assertGreater(out["grid_luma_spread"], 0.02,
+                           "a degenerate region grid means composition is invisible")
+        self.assertGreaterEqual(len(set(out["candidate_crop_areas"])), 2)
+
+    def test_selftest_fails_loudly_with_a_broken_prober(self):
+        env = dict(os.environ, DSH_IMAGEMAGICK="/usr/bin/convert", DSH_IDENTIFY="/bin/false")
+        r = subprocess.run([PY, PHOTO_CORE, "selftest"], capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("dimensions", json.loads(r.stdout)["error"])
+
+    def test_temperature_reaches_the_render(self):
+        """`-colorize 0` was a no-op, so a declared+featured field was dead."""
+        d = tempfile.mkdtemp(prefix="phototemp_")
+        try:
+            def grade(t):
+                return {"operations": [{"op": "grade", "exposure": 1.0, "contrast": 0.0,
+                                        "saturation": 1.0, "temperature": t}]}
+            outs = {}
+            for label, t in (("neutral", 0.0), ("warm", 0.4)):
+                path = os.path.join(d, f"{label}.png")
+                pc.cmd_render(self.img, grade(t), path)
+                outs[label] = pc.cmd_inspect(path)
+            rb = lambda i: i["mean_rgb"][0] - i["mean_rgb"][2]
+            self.assertGreater(rb(outs["warm"]), rb(outs["neutral"]),
+                               "a positive temperature must warm the render (R up, B down)")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -565,23 +666,35 @@ class TestPhotoPerCreatorIdentity(unittest.TestCase):
                         "the tight-crop identity did not learn to frame tighter")
         self.assertGreaterEqual(tighter, len(self.neutral) // 2)
 
-    def test_preference_does_not_transfer_to_an_unseen_crop_geometry(self):
-        """Documented limitation, measured rather than assumed: the taste variable
-        (crop geometry) is confounded with the content the crop reveals, so on a
-        geometry outside the training family the learned preference does not
-        hold. Asserted only as 'no better than in-distribution'."""
+    def test_preference_transfers_to_an_unseen_geometry_but_more_weakly(self):
+        """Re-measured after the GRPO ratio baseline was corrected.
+
+        The earlier "no transfer" result (0/10) was produced by an objective whose
+        negative advantages had no gradient (the ratio was a constant 1/Z). With
+        that fixed the preference DOES transfer to an unseen crop geometry — but
+        with a smaller margin than in-distribution, so the geometry/content
+        confound documented in docs/paper-findings.md (Finding 4c) narrows the
+        effect rather than erasing it.
+        """
         ood = self._picks(self.ood)
         in_dist = self._picks(self.neutral)
         ood_diff = sum(1 for x, y in zip(ood["tight"], ood["loose"]) if abs(x - y) > 1e-9)
         in_diff = sum(1 for x, y in zip(in_dist["tight"], in_dist["loose"]) if abs(x - y) > 1e-9)
-        print(f"\n  [out-of-distribution] ONE unseen crop geometry, "
-              f"{len(self.ood)} distinct briefs (n_eff = {len(self.ood)}, "
-              f"but only one geometry)")
-        print(f"  briefs picked differently: {ood_diff}/{len(self.ood)}")
+
+        def gap(picks):
+            mean = lambda xs: sum(xs) / len(xs)
+            return mean(picks["loose"]) - mean(picks["tight"])
+
+        ood_gap, in_gap = gap(ood), gap(in_dist)
+        print(f"\n  [out-of-distribution] ONE unseen crop geometry, {len(self.ood)} distinct briefs")
+        print(f"  briefs picked differently: {ood_diff}/{len(self.ood)}"
+              f" | margin (loose-tight) {ood_gap:.3f} vs in-distribution {in_gap:.3f}")
         print(f"  tight picks: {[round(x, 3) for x in ood['tight']]}")
         print(f"  loose picks: {[round(x, 3) for x in ood['loose']]}")
-        self.assertLessEqual(ood_diff, in_diff,
-                             "out-of-distribution selection separated more than in-distribution")
+        self.assertGreaterEqual(ood_diff, len(self.ood) // 2,
+                                "the preference no longer transfers to the unseen geometry")
+        self.assertLess(ood_gap, in_gap,
+                        "the unseen geometry should narrow the margin, not widen it")
 
     def test_training_groups_are_not_all_ties(self):
         self._train_pair()

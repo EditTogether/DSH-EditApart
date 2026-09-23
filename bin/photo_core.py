@@ -67,6 +67,28 @@ def _resolve_magick() -> str:
 MAGICK = _resolve_magick()
 
 
+def _identify_prefix() -> list[str]:
+    """The argv prefix that runs `identify`.
+
+    ImageMagick 7 has ONE binary (`magick identify …`); ImageMagick 6 has two
+    (`convert` for rendering, `identify` for probing) and `convert identify …`
+    is NOT a thing — it treats "identify" as an input filename. Resolving only
+    `convert` and then asking it for dimensions silently returned 0x0, which
+    silently degenerated every crop in the photo layout. Prefer the configured
+    binary's own subcommand, then DSH_IDENTIFY, then the sibling `identify`
+    (IM6 installs them side by side), then PATH.
+    """
+    env = os.getenv("DSH_IDENTIFY")
+    if env:
+        return [env]          # an explicit override always wins
+    if os.path.basename(MAGICK) == "magick":
+        return [MAGICK, "identify"]
+    sibling = os.path.join(os.path.dirname(os.path.abspath(MAGICK)), "identify")
+    if os.path.exists(sibling):
+        return [sibling]
+    return [shutil.which("identify") or "identify"]
+
+
 def _taste():
     """Import bin/taste_model.py (sitting next to this file), lazily, so the
     legacy inspect/propose/render/critic/revise path never needs numpy."""
@@ -106,19 +128,44 @@ def _ensure_magick() -> None:
             f"no ImageMagick renderer reachable (tried {MAGICK}); set DSH_IMAGEMAGICK, "
             "install magick, or use an in-browser ImageMagick renderer plugin for the web profile",
         )
+    prefix = _identify_prefix()
+    if shutil.which(prefix[0]) is None and not os.path.exists(prefix[0]):
+        raise RuntimeError(
+            f"no ImageMagick `identify` reachable (tried {' '.join(prefix)}); set DSH_IDENTIFY "
+            "to the identify binary that ships beside your renderer (ImageMagick 6 installs "
+            "`convert` and `identify` as separate binaries)", 
+        )
 
 
 # --------------------------------------------------------------------------
 # inspect
 # --------------------------------------------------------------------------
 def _dims(src: str) -> list[int]:
-    r = run([MAGICK, "identify", "-format", "%w %h", src])
+    """Image dimensions, or a LOUD failure.
+
+    Returning [0, 0] on failure was the worst possible behaviour: `inspect`
+    reported 0x0, percent crops became `0x0+0+0`, and the entire spatial feature
+    axis (crop area / centre / thirds / region statistics) went to zero while
+    every downstream step still "succeeded".
+    """
+    prefix = _identify_prefix()
+    r = run([*prefix, "-format", "%w %h", src])
+    detail = (r.stderr or r.stdout or "").strip()
+    detail = detail.splitlines()[-1][:200] if detail else "no output"
     if r.returncode != 0 or not r.stdout.strip():
-        return [0, 0]
+        raise RuntimeError(
+            f"cannot read image dimensions from {src!r}: {' '.join(prefix)} failed ({detail}). "
+            "Set DSH_IMAGEMAGICK to a working ImageMagick and DSH_IDENTIFY to its identify "
+            "binary — ImageMagick 6 has no `magick` subcommand, so a bare `convert` cannot "
+            "answer `identify`.")
     try:
-        return [int(v) for v in r.stdout.strip().split()[:2]]
-    except ValueError:
-        return [0, 0]
+        w, h = (int(v) for v in r.stdout.strip().split()[:2])
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            f"unparsable identify output for {src!r}: {r.stdout[:80]!r}")
+    if w <= 0 or h <= 0:
+        raise RuntimeError(f"identify reported non-positive dimensions for {src!r}: {w}x{h}")
+    return [w, h]
 
 
 def _luma_samples(src: str) -> bytes:
@@ -377,6 +424,14 @@ def cmd_propose(src: str, inspect: dict, rubric: dict, group: int = 1,
     reward.
     """
     tm = _taste()
+    w_img = int(inspect.get("width") or 0)
+    h_img = int(inspect.get("height") or 0)
+    if w_img <= 0 or h_img <= 0:
+        raise RuntimeError(
+            "inspect carries no usable dimensions (width/height are 0): a percent crop computed "
+            "from 0x0 produces `0x0+0+0`, which silently degenerates the whole spatial feature "
+            "axis (crop area, centre, thirds, region statistics). Re-run inspect with a working "
+            "ImageMagick / DSH_IDENTIFY before proposing a group.")
     grid = _grid_for(group)
     variants: list[dict] = []
     for (grade_f, crop_f, sharp_f, cap_f, exp_nudge, con_nudge) in grid:
@@ -401,18 +456,23 @@ def cmd_propose(src: str, inspect: dict, rubric: dict, group: int = 1,
     work = workdir
     if score_candidates and not work:
         work = os.path.join(os.path.dirname(os.path.abspath(dataset)), "candidates") if dataset else None
+    # Candidate renders are the caller's to LOOK at (the skill asks for exactly
+    # that before choosing), so they are kept — but in ONE directory per call, not
+    # a fresh temp dir per candidate per call as before.
+    tmp_dir = None
+    if score_candidates and not work:
+        import tempfile
+        tmp_dir = tempfile.mkdtemp(prefix="dshep_")
     for i, v in enumerate(variants):
         if not score_candidates:
             v["critic"] = None
             v["render"] = None
             continue
-        out_dir = work or None
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-            out = os.path.join(out_dir, f"cand_{i}.png")
+        if work:
+            os.makedirs(work, exist_ok=True)
+            out = os.path.join(work, f"cand_{i}.png")
         else:
-            import tempfile
-            out = os.path.join(tempfile.mkdtemp(prefix="dshep_"), f"cand_{i}.png")
+            out = os.path.join(tmp_dir, f"cand_{i}.png")
         cmd_render(src, v["schema"], out)
         v["critic"] = cmd_critic(v["schema"], rubric, out, None)
         v["render"] = out
@@ -421,6 +481,14 @@ def cmd_propose(src: str, inspect: dict, rubric: dict, group: int = 1,
     scorer = tm.TasteScorer.load(identity, style) if identity else None
     spec = scorer.feature_spec if scorer else tm.FEATURE_SPEC_PHOTO
     feats = [tm.features_for(spec, v["schema"], inspect, rubric) for v in variants]
+    # A group whose candidates are indistinguishable to the model cannot teach it
+    # anything; that happens when a knob has no effect (dedup usually catches it)
+    # or when geometry silently collapsed. Refuse rather than log useless data.
+    if len(variants) > 1 and all(f == feats[0] for f in feats[1:]):
+        raise RuntimeError(
+            f"{len(variants)} candidates but an identical feature vector — the group carries no "
+            "signal. Check that the renderer reports real dimensions and that the rubric leaves "
+            "at least one knob free (exposure/contrast/crop/sharpen/caption).")
     scores = scorer.score_many(feats) if scorer else [None] * len(variants)
     rewards = [(v["critic"]["reward"] if v["critic"] else None) for v in variants]
     selected, select_by = _select(scores, rewards, select, scorer is not None)
@@ -519,12 +587,15 @@ def _grade_args(g: dict) -> list[str]:
         args += ["-sigmoidal-contrast", f"{con}x50%"]
     temp = float(g.get("temperature", 0.0))
     if temp:
-        # temperature>0 warms (R up, B down); <0 cools.
-        r = int(round(255 * temp))
-        args += ["-channel", "RGB",
-                 "-fill", f"rgb({int(255 + r)},255,{int(255 - r)})",
-                 "-colorize", "0",
-                 "-channel", "RGB"]
+        # temperature>0 warms (R up, B down), <0 cools. The previous form emitted
+        # `-fill rgb(255+r,255,255-r) -colorize 0`: a 0% blend is a NO-OP, and
+        # `255+r` can exceed 255 — so a field that the schema declares and the
+        # feature layout reads (temp_abs) was dead at render time. Two per-channel
+        # multiplies implement the documented semantics instead.
+        t = max(-1.0, min(1.0, float(temp)))
+        args += ["-channel", "R", "-evaluate", "Multiply", f"{1.0 + t:g}",
+                 "-channel", "B", "-evaluate", "Multiply", f"{1.0 - t:g}",
+                 "+channel"]
     return args
 
 
@@ -645,7 +716,7 @@ def cmd_revise(schema: dict, critic: dict) -> dict:
     if not kept:
         kept = schema.get("operations", [])
     schema["operations"] = kept
-    schema["meta"]["revised_by"] = "photo-critic"
+    schema.setdefault("meta", {})["revised_by"] = "photo-critic"
     return schema
 
 
@@ -708,6 +779,58 @@ def cmd_taste(identity: str, style: str | None = None, features: str | None = No
                             _fixture(rubric))
     return {"score": scorer.score_features(feats), "features": feats,
             "feature_spec": scorer.feature_spec}
+
+
+# --------------------------------------------------------------------------
+# selftest (environment conformance)
+# --------------------------------------------------------------------------
+def cmd_selftest() -> dict:
+    """Prove that THIS install's renderer/prober can support the photo loop.
+
+    A review of this preset found that resolving an ImageMagick 6 `convert` and
+    asking it for dimensions returned 0x0 SILENTLY: every percent crop became
+    `0x0+0+0` and the whole spatial feature axis the photo layout exists for went
+    to zero, while propose/critic/render all still reported success. The fix makes
+    that failure loud; this check is the positive direction — run it before
+    trusting a logged group, and in CI for a new environment.
+    """
+    import tempfile
+    d = tempfile.mkdtemp(prefix="dshe_selftest_")
+    try:
+        fixture = os.path.join(d, "fixture.png")
+        r = subprocess.run([MAGICK, "-size", "600x400", "xc:#20303c",
+                            "-fill", "#ffe9a8", "-draw", "circle 430,150 430,60",
+                            "-fill", "#0d1218", "-draw", "rectangle 40,300 250,390",
+                            fixture], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"renderer cannot draw a fixture: {r.stderr.strip()[:200]}")
+        insp = cmd_inspect(fixture)
+        if insp["width"] <= 0 or insp["height"] <= 0:
+            raise RuntimeError(f"inspect returned {insp['width']}x{insp['height']} dimensions")
+        cells = (insp.get("regions") or {}).get("cells") or []
+        lumas = [c["luma"] for row in cells for c in row]
+        grid_spread = (max(lumas) - min(lumas)) if lumas else 0.0
+        if not cells or grid_spread <= 0.02:
+            raise RuntimeError(
+                f"the region grid is degenerate (spread {grid_spread:.3f}); crop-region "
+                "features would be constant and photo taste would be deaf to composition")
+        rubric = {"intent": "selftest", "saturation": 1.15, "crop": {"percent": [0.1, 0.1, 0.6, 0.5]},
+                  "width": 600, "target_luma": 0.5}
+        out = cmd_propose(fixture, insp, rubric, group=4, select="objective",
+                          score_candidates=False)
+        areas = []
+        for cand in out["group"]["candidates"]:
+            for op in cand["operations"]:
+                if op.get("op") == "crop":
+                    areas.append(round(op["w"] * op["h"] / (insp["width"] * insp["height"]), 4))
+                    break
+        if len(set(areas)) < 2:
+            raise RuntimeError(f"candidate crops are not distinct: {areas}")
+        return {"ok": True, "renderer": MAGICK, "identify": " ".join(_identify_prefix()),
+                "dims": f"{insp['width']}x{insp['height']}", "grid": len(cells),
+                "grid_luma_spread": round(grid_spread, 3), "candidate_crop_areas": areas}
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------
@@ -776,6 +899,7 @@ def main() -> int:
     p.add_argument("--dataset", default=os.getenv("DSH_EDITAPART_DATASET"))
     p.add_argument("--style", default=os.getenv("DSH_EDITAPART_STYLE"))
 
+    sub.add_parser("selftest", help="check this install's renderer/prober")
     p = sub.add_parser("taste")
     p.add_argument("--identity", default=os.getenv("DSH_EDITAPART_IDENTITY"), required=False)
     p.add_argument("--style", default=os.getenv("DSH_EDITAPART_STYLE"))
@@ -825,6 +949,8 @@ def main() -> int:
                                        spec=args.spec)
         elif args.cmd == "taste_status":
             result = cmd_taste_status(args.identity, args.dataset, args.style)
+        elif args.cmd == "selftest":
+            result = cmd_selftest()
         elif args.cmd == "taste":
             if not args.identity:
                 raise RuntimeError("taste needs --identity (or DSH_EDITAPART_IDENTITY)")

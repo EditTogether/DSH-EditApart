@@ -115,12 +115,12 @@ than video, and all three are measured rather than assumed:
 Measured on a synthetic 1600×1200 image, two creators with opposite framing taste
 (tightest vs loosest crop) sharing one frozen trunk: **10/10 held-out briefs from
 the training family are picked differently, 10/10 in the predicted direction**
-(mean crop area 0.155 vs 0.389). On **one unseen crop geometry the selection does
-not transfer: 0/10 over ten distinct briefs** — the crop-area feature is
-confounded with the region statistics of the content the crop exposes. Note the
-split: the *ordering* over crop areas still transfers (rank correlation strongly
-signed at every probe) while the *selection* does not, because other features
-dominate the argmax.
+(mean crop area 0.155 vs 0.389). On **one unseen crop geometry it transfers too —
+10/10 over ten distinct briefs — but with a smaller margin**: mean crop area 0.30
+vs 0.45, a gap of 0.15 against 0.233 in-distribution. That is the geometry/content
+confound of `docs/paper-findings.md` (Finding 4c) narrowing the effect, not
+erasing it. (An earlier "0/10, no transfer" reading came from the objective bug
+described under **Corrections**; it was an artifact and is withdrawn.)
 
 A four-arm follow-up (`tests/experiment_photo_transfer.py`: {1 image, 3 images} ×
 {fixed, varied crop family}, shared probe ladder, matched steps) found the repair
@@ -201,13 +201,14 @@ train_identity modality=photo creator=erkin
 ```
 
 `chosen_by=creator|agent` matters: the pick is logged as a **revealed
-preference**, becomes that group's top reward, and — more importantly — gives the
-trainer a preference term. A rubric-derived reward alone cannot identify per-user
-taste: with no user-dependent term in the objective, two creators with opposite
-tastes separate on only **5/12** neutral briefs (direction at chance), versus
-**12/12 in the predicted direction** once the revealed pick is in the objective
-(24.9 s vs 12.0 s mean selected duration). The preference loss at the default
-weight is sufficient; the reward override is a robust belt-and-braces addition.
+preference**, becomes that group's top reward, and gives the trainer a preference
+term. A rubric-derived reward alone cannot identify per-user taste: with no
+user-dependent term in the objective, two creators with opposite tastes differ on
+only **4/12** neutral briefs (p ≈ 0.21 against the unrelated-picks null), versus
+**8/12** (p ≈ 0.0006) once the revealed pick is in the objective (margins +3.6 s
+vs +7.0…+9.4 s). The override additionally fits the creator's own corpus far
+better than the auxiliary loss (0.83/1.00 vs 0.22/0.26), so both mechanisms are
+kept; `tests/experiment_revealed_preference.py` reproduces the whole table.
 
 ### Measured results
 
@@ -218,10 +219,10 @@ weight is sufficient; the reward override is a robust belt-and-braces addition.
 | The identity is interpolatable | midpoint latent brackets the endpoints for ≥70% of candidates and moves the mean monotonically |
 | Optimizer split holds | Muon touches 2D only, AdamW 1D only (asserted, with witnesses) |
 | Artifacts round-trip | GGUF write→read bit-exact; digest mismatch refused |
-| The identity changes the loop | two creators on the same shared trunk: **12/12** neutral briefs differed, 12/12 in the predicted direction, **24.9s vs 12.0s** mean selected duration |
-| The revealed pick is what carries taste | ablation: **5/12** differing (direction at chance) with no user term in the objective vs **12/12** with it; preference loss alone 12/12, reward override alone 10/12 |
-| Photo taste works, but only in-family | two creators, one shared trunk: **10/10** held-out briefs picked differently (10/10 in direction, crop area 0.155 vs 0.389); on **one unseen crop geometry 0/10** over ten distinct briefs (ordering still transfers; the selection does not) |
-| The repair is partial and content-driven | 4-arm transfer experiment: only the 3-image/narrow-family arm transferred to an unseen image+geometry (**3/3**, ratio 0.400) vs **0/3** for both varied-geometry arms; a no-taste control put the metric's noise floor at ±0.36 |
+| The identity changes the loop | two creators on the same shared trunk: **8/12** neutral briefs differed, 8/12 in the predicted direction, **21.4s vs 12.0s** mean selected duration (re-measured after the objective fix below) |
+| The revealed pick is what carries taste | ablation (re-measured): with no user term **4/12** briefs differ (p ≈ 0.21, indistinguishable from unrelated picks) vs **8/12** (p ≈ 0.0006) for every mechanism tried; the reward override also fits the creator's own corpus far better (0.83/1.00 vs 0.22/0.26) and widens the margin (+9.4s vs +7.0s) |
+| Photo taste transfers, with a narrower margin out of family | two creators, one shared trunk: **10/10** held-out briefs picked differently (10/10 in direction, crop area **0.155 vs 0.389**); on **one unseen crop geometry 10/10** but with a smaller gap (**0.30 vs 0.45**) — the geometry/content confound narrows it |
+| The repair is partial and content-driven | 4-arm transfer experiment (re-measured): only the 3-image/narrow-family arm transferred to an unseen image+geometry (tight/loose ratio **0.400**) while A1/A2/B2 showed no effect (1.000); on a *seen* image at the same geometry three of four arms did separate. The ±0.36 ordering-metric noise floor from the no-taste control is a pre-fix measurement |
 | The loop is numpy-optional | legacy `propose group=1` and group logging work with numpy blocked; only the model path errors |
 
 Reproduce with `tests/test_taste_model.py` (35 tests, no media needed) and
@@ -401,6 +402,55 @@ On a synthetic 1800×1200 landscape (`photo.jpg`), rubric = warm punch, saturati
   credit inside the tolerance exactly as before, linear falloff outside it, so a
   candidate that passes is scored identically to the pre-grading critic.
 
+## Corrections
+
+An external review re-ran the suites and reproduced five defects. All are fixed
+here, and the behavioural numbers this README reports were re-measured afterwards
+(the earlier figures are withdrawn, not silently kept).
+
+1. **The GRPO ratio was not a ratio** (`bin/taste_model.py`). `train()` stored raw
+   standardised logits as the ratio baseline, so `rho = exp(log_softmax(s) - s) =
+   1/Z` — a per-group constant. Negative-advantage candidates then always fell
+   into the clipped branch and their downward push stopped depending on `|A|`
+   (measured: an identical 0.0268 for A = −0.1, −2.0 and −8.0), so the objective
+   had silently degenerated to positive-only REINFORCE. The telemetry had the same
+   bug: `clip_fraction` was a per-call sum divided by the batch count, reported as
+   5.9 (a "fraction" of 590%). Fixed by storing `log_softmax(...)` and separating
+   the two denominators; `tests/test_taste_model.py::TestObjectiveFidelity` pins
+   `rho == 1`, `clip_fraction ∈ [0, 1]`, and that a −2.0 advantage pushes ~10×
+   harder than a −0.1 one. **Consequence:** video per-creator separation
+   re-measures 12/12 → **8/12** (21.4s vs 12.0s) and the photo out-of-family
+   result 0/10 → **10/10 with a narrower margin** (0.30 vs 0.45).
+2. **ImageMagick 6 silently killed the photo loop's crop axis**
+   (`bin/photo_core.py`). Resolving `convert` and then running `convert identify …`
+   fails on IM6, and `_dims` returned `0x0` **silently**: every percent crop became
+   `0x0+0+0` and the entire spatial feature family went to zero while
+   inspect/propose/render/critic all still reported success. Now the identify
+   binary is resolved separately (`DSH_IDENTIFY` > `magick identify` > sibling
+   `identify` > PATH), a dimension failure is loud, `propose` refuses a
+   dimension-less inspect or an all-identical candidate group, and both cores ship
+   a `selftest` conformance check (`python bin/photo_core.py selftest`).
+3. **A video render hard-required audio on every input.** One muted clip failed the
+   whole graph with "Stream specifier 'a' matched no streams". A silent input now
+   gets `anullsrc`, and when *no* input carries audio the silence is emitted
+   without `loudnorm` — single-pass `loudnorm` on digital silence divides by zero
+   energy and hands the AAC encoder NaN.
+4. **`"reward_obj": null` aborted the whole training log** (`float(None)`).
+   Unscored candidates are tolerated and skipped, with counters surfaced by
+   `taste_status`.
+5. **The video E2E logged the wrong candidate's reward**: it critiqued the
+   *selected* schema while labelling the reward with `--candidate <pick>`. Candidate
+   schemas are now exposed in the group metadata — which is also what the skill's
+   "render a different candidate than the selected one" workflow requires — and the
+   test asserts the logged reward is the picked candidate's.
+
+Smaller fixes from the same review: schema values that reach the ffmpeg
+filtergraph are validated (`_num`/`_ff_crop`), `revise` no longer `KeyError`s on a
+schema without `meta`, photo `temperature` actually renders (it was
+`-fill … -colorize 0`, a 0% no-op), one temp dir per propose call instead of one
+per candidate, `created_at`/`trained_at` artifact metadata made consistent, and an
+empty `style_file` no longer resolves to a directory.
+
 ## Verification
 
 ```bash
@@ -431,9 +481,9 @@ different revealed preferences through the real loop, trains one shared trunk
 plus two frozen-trunk identities, and asserts that the same neutral brief gets
 materially different edits — then renders the taste-selected schema with real
 ffmpeg and critiques/revises it. Measured on
-`better-com-ceo-roasted-by.mp4` (41.7s, 23 shots): 12/12 briefs differed,
-long-take 24.9s vs short-take 12.0s mean selected duration; the rendered
+`better-com-ceo-roasted-by.mp4` (41.7s, 23 shots): **8/12** briefs differed,
+long-take 21.4s vs short-take 12.0s mean selected duration; the rendered
 taste-selected edit was 18.75s, critic overall −0.15, 10 → 7 segments after
-revise.
+revise. (These are the post-correction numbers; see **Corrections** below.)
 
 See `skills/edit-apart/SKILL.md` for the full protocol.

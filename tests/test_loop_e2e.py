@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -104,11 +105,20 @@ class TestLoopE2E(unittest.TestCase):
             cands = out["group"]["candidates"]
             picker = max if longer else min
             pick = picker(range(len(cands)), key=lambda j: cands[j]["duration"])
-            crit = engine("critic", json.dumps(out), json.dumps(self.inv),
+            # The revealed pick's OWN schema. Passing the whole propose output
+            # would critique the SELECTED candidate's structure while labeling the
+            # reward with --candidate pick, i.e. mislabel the field the trainer reads.
+            crit = engine("critic", json.dumps(cands[pick]["schema"]), json.dumps(self.inv),
                           json.dumps(rub), "--dataset", ds,
                           "--group-id", out["group"]["group_id"],
                           "--candidate", str(pick), "--chosen-by", "creator")
             self.assertIn("logged", crit)
+            # Regression guard: the logged reward must be the PICKED candidate's.
+            # Passing the whole propose output (whose top-level structure is the
+            # SELECTED candidate) critiques a different schema while labeling the
+            # reward with --candidate pick.
+            self.assertEqual(crit["reward"], cands[pick]["reward_obj"],
+                             "the logged reward is not the picked candidate's")
             self.assertEqual(crit["logged"]["chosen_by"], "creator")
         return ds
 
@@ -150,8 +160,12 @@ class TestLoopE2E(unittest.TestCase):
             m = tm.train(ds, path, style=style, creator=name, epochs=300, seed=0,
                          freeze_style=True)
             self.assertTrue(m["style_frozen"])
-            self.assertEqual(m["history"][-1]["train_rank_acc"], 1.0,
-                             f"{name} did not even fit its own revealed preferences")
+            # A PERFECT fit is not the bar: the earlier 1.0 was measured under a
+            # degenerate objective that only reinforced positive advantages (see
+            # TestObjectiveFidelity). What matters is that the identity separates
+            # its own corpus well above chance (1/K) before we ask about transfer.
+            self.assertGreaterEqual(m["history"][-1]["train_rank_acc"], 0.6,
+                                    f"{name} did not fit its own revealed preferences")
             ident[name] = path
         # the shared trunk must be byte-identical after both identity runs
         digests = {tm.TasteScorer.load(p, style=style).model.shared_digest()
@@ -219,6 +233,83 @@ class TestLoopE2E(unittest.TestCase):
         print(f"\n  rendered taste-selected edit: {rendered.get('duration')}s, "
               f"critic overall {crit['overall_score']}, "
               f"{len(out['structure'])} -> {len(revised['structure'])} segments after revise")
+
+
+class TestVideoRenderRobustness(unittest.TestCase):
+    """Renders that must not fail, and malformed values that must fail clearly."""
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("ffmpeg") is None:
+            raise unittest.SkipTest("ffmpeg not available")
+        cls.tmp = tempfile.mkdtemp(prefix="renderrobust_")
+        cls.mute = os.path.join(cls.tmp, "mute.mp4")
+        cls.tone = os.path.join(cls.tmp, "tone.mp4")
+        for path, extra in ((cls.mute, ["-an"]),
+                            (cls.tone, ["-f", "lavfi", "-i", "sine=frequency=440", "-shortest"])):
+            r = subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                                "testsrc=size=320x240:rate=10", *extra, "-t", "2",
+                                "-pix_fmt", "yuv420p", path],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                raise unittest.SkipTest(f"could not synthesize a test clip: {r.stderr[:200]}")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _schema(crop=None):
+        tf = {"scale": 1.0, "crop": crop, "position": None}
+        return {"structure": [{
+            "shot": "clip_001", "trim": {"in": 0.0, "out": 1.0}, "retime": 0.0,
+            "timeline": {"in": 0.0, "out": 1.0},
+            "transition": {"type": "cut", "dur": 0.0, "params": {}},
+            "transform": tf, "grade": {"lut": None, "eq": {}},
+            "audio": {"level": 1.0, "duck": 0.0, "fade": 0.0}, "overlay": [], "why": "t"}]}
+
+    def test_a_source_without_audio_still_renders(self):
+        out = os.path.join(self.tmp, "mute_out.mp4")
+        rendered = engine("render", self.mute, json.dumps(self._schema()), out)
+        self.assertTrue(os.path.exists(out))
+        # the silence fallback gives the output a real audio track
+        probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a",
+                                "-show_entries", "stream=codec_type", "-of", "csv=p=0", out],
+                               capture_output=True, text=True)
+        self.assertTrue(probe.stdout.strip(), "expected a synthesized silent audio stream")
+        self.assertIn("out", rendered)
+
+    def test_a_source_with_audio_still_renders(self):
+        out = os.path.join(self.tmp, "tone_out.mp4")
+        engine("render", self.tone, json.dumps(self._schema()), out)
+        self.assertTrue(os.path.exists(out))
+
+    def test_selftest_reports_a_working_environment(self):
+        """The video loop's conformance check: inventory + features + a real render."""
+        if not (os.environ.get("DSH_SCENEDETECT") or shutil.which("scenedetect")):
+            self.skipTest("scenedetect not on PATH and DSH_SCENEDETECT unset")
+        out = engine("selftest")
+        self.assertTrue(out["ok"])
+        self.assertGreaterEqual(out["shots"], 1)
+        self.assertGreater(out["mean_motion"], 0.0, "degenerate features")
+        self.assertTrue(out["rendered_duration"])
+
+    def test_a_hostile_crop_value_is_rejected_clearly(self):
+        schema = self._schema(crop="800:600:0:0,movie=/etc/passwd")
+        r = subprocess.run([PY, CORE, "render", self.tone, json.dumps(schema),
+                            os.path.join(self.tmp, "nope.mp4")],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("transform.crop", json.loads(r.stdout)["error"])
+
+    def test_a_non_numeric_scale_is_rejected_clearly(self):
+        schema = self._schema()
+        schema["structure"][0]["transform"]["scale"] = "1.0,eq=brightness=1"
+        r = subprocess.run([PY, CORE, "render", self.tone, json.dumps(schema),
+                            os.path.join(self.tmp, "nope2.mp4")],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("transform.scale", json.loads(r.stdout)["error"])
 
 
 if __name__ == "__main__":

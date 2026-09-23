@@ -942,12 +942,18 @@ def logits_to_utility_grads(dloss_ds, v, std: float, temperature: float):
 def grpo_loss_and_grads(model: StyleBrain, groups: list[dict],
                         old_logits: list, temperature: float = 0.5,
                         clip_eps: float = 0.2, entropy_coef: float = 0.01,
-                        pref_coef: float = 0.5, model_grads_out: dict | None = None):
+                        pref_coef: float = 0.5, model_grads_out: dict | None = None,
+                        utility_grads_out: list | None = None):
     """Dense group-relative REINFORCE-with-clip objective + pairwise preference.
 
     `groups[i]` = {"X": (N,d_in) array, "A": (N,) advantages, "chosen": idx|None}
-    `old_logits[i]` = the logits that were current when the ratio baseline was
-    taken (standard PPO: the ratio baseline is frozen for the epoch).
+    `old_logits[i]` = **log-probabilities** (i.e. `log_softmax(s)`) at the moment
+    the ratio baseline was taken — never the raw logits `s`. Passing raw logits
+    makes `rho = exp(log_softmax(s) - s) = 1/Z`, a per-group constant: the ratio
+    stops being a ratio, every negative-advantage candidate lands in the clipped
+    branch and loses its direct gradient, and the objective silently degrades to
+    positive-only REINFORCE. `train()` stores `log_softmax(...)` for this reason
+    and `tests/test_taste_model.py` asserts `rho == 1` under the frozen baseline.
     """
     np = model.np
     total = 0.0
@@ -1005,6 +1011,11 @@ def grpo_loss_and_grads(model: StyleBrain, groups: list[dict],
         n_groups += 1
 
         du = logits_to_utility_grads(dloss_ds, v, pol["std"], temperature).reshape(-1, 1)
+        if utility_grads_out is not None:
+            # The objective's d(loss)/d(utility) for this group, exposed so tests
+            # can assert the advantage direction (a negative advantage must push
+            # its utility DOWN) through the real code path rather than a copy.
+            utility_grads_out.append(du.reshape(-1).copy())
         cache: dict = {}
         model._trunk(X, model.p["z_u"], cache)
         grads = model.backward(du, cache)
@@ -1084,9 +1095,12 @@ def load_groups(path: str) -> tuple[list[dict], dict]:
                      "feature_spec": rec.get("feature_spec", FEATURE_SPEC_VIDEO),
                      "chosen": None, "chosen_by": None, "candidates": []}
                 for c in rec.get("candidates", []):
+                    # The photo engine writes reward_obj: null for unscored
+                    # candidates; `float(None)` used to abort the whole log file.
+                    raw = c.get("reward_obj", c.get("reward"))
                     g["candidates"].append({
                         "features": c.get("features") or {},
-                        "reward": float(c.get("reward_obj", c.get("reward", 0.0))),
+                        "reward": (None if raw is None else float(raw)),
                         "overall": (None if c.get("overall_obj") is None
                                     else float(c["overall_obj"])),
                         "dense": (None if c.get("dense_obj") is None
@@ -1129,36 +1143,43 @@ def build_training_arrays(path: str, lambda_dense: float = 1.0,
         if spec not in FEATURE_SPECS:
             stats.setdefault("unknown_specs", []).append(spec)
             continue
-        X = np.array([to_vector(c["features"], spec) for c in g["candidates"]], dtype=np.float64)
-        rewards = []
-        for c in g["candidates"]:
+        cands = g["candidates"]
+        rewards: list[float | None] = []
+        for c in cands:
             if c.get("overall") is not None and c.get("dense") is not None:
                 rewards.append(c["overall"] + lambda_dense * c["dense"])
             else:
-                rewards.append(c["reward"])
-        r = np.array(rewards, dtype=np.float64)
-        # A logged CREATOR (or agent) pick is a revealed preference, not just
-        # another critic score. A rubric-derived reward cannot identify per-user
-        # taste — the objective has to carry a user-dependent term. The aux
-        # preference loss does most of the work here; the bonus additionally makes
-        # the revealed pick the group's best reward, so the group-relative
-        # advantage agrees with the creator's choice and the dense critic shaping
-        # stays interpretable. Ablation (12 neutral briefs, two opposite tastes):
-        # no preference term 5/12 differing (direction at chance); preference loss
-        # alone 12/12; reward override alone 10/12. See docs/paper-findings.md.
+                rewards.append(c.get("reward"))
         chosen = g.get("chosen")
         chosen_by = g.get("chosen_by")
-        if (chosen is not None and 0 <= chosen < len(r)
+        # A revealed pick OUTRANKS whatever was scored, and it can also supply the
+        # reward of a candidate nobody scored — that is the point of a revealed
+        # preference. With no scores at all it becomes the group's only signal.
+        if (chosen is not None and 0 <= chosen < len(rewards)
                 and chosen_by in ("creator", "agent", "human")):
-            r = r.copy()
-            r[chosen] = float(r.max()) + float(revealed_pref_bonus)
+            known = [r for r in rewards if r is not None]
+            base = max(known) if known else 0.0
+            rewards[chosen] = base + float(revealed_pref_bonus)
+        scored = [(i, float(r)) for i, r in enumerate(rewards) if r is not None]
+        stats["candidates_unscored"] = stats.get("candidates_unscored", 0) + (
+            len(rewards) - len(scored))
+        if len(scored) < 2:
+            # Nothing group-relative to compute. Counted, never fabricated.
+            key = "groups_unscored" if not scored else "groups_singleton"
+            stats[key] = stats.get(key, 0) + 1
+            continue
+        idxs = [i for i, _ in scored]
+        X = np.array([to_vector(cands[i]["features"], spec) for i in idxs], dtype=np.float64)
+        r = np.array([v for _, v in scored], dtype=np.float64)
         prepared.append({"group_id": g["group_id"], "clip_id": g["clip_id"], "spec": spec,
                          "X": X, "rewards": r, "A": group_advantage(r),
-                         "chosen": chosen, "chosen_by": chosen_by})
-    usable = [p for p in prepared if p["X"].shape[0] >= 2]
-    stats["groups_total"] = len(prepared)
-    stats["groups_usable"] = len(usable)
-    stats["groups_singleton"] = len(prepared) - len(usable)
+                         "chosen": (idxs.index(chosen) if chosen in idxs else None),
+                         "chosen_by": chosen_by})
+    stats["groups_total"] = len(prepared) + stats.get("groups_singleton", 0) \
+        + stats.get("groups_unscored", 0)
+    stats["groups_usable"] = len(prepared)
+    stats.setdefault("groups_singleton", 0)
+    stats.setdefault("groups_unscored", 0)
     return prepared, stats
 
 
@@ -1188,13 +1209,16 @@ def dataset_status(path: str) -> dict:
     if not os.path.exists(path):
         return {"path": path, "exists": False, "groups": 0, "ready_to_train": False}
     groups, stats = load_groups(path)
-    rewards = [c["reward"] for g in groups for c in g["candidates"]]
+    rewards = [c["reward"] for g in groups for c in g["candidates"]
+               if c.get("reward") is not None]
     usable = sum(1 for g in groups
                  if len(g["candidates"]) >= 2 and g["feature_spec"] in FEATURE_SPECS)
     specs = sorted({g["feature_spec"] for g in groups})
     spreads = []
+    unscored = 0
     for g in groups:
-        rs = [c["reward"] for c in g["candidates"]]
+        rs = [c["reward"] for c in g["candidates"] if c.get("reward") is not None]
+        unscored += len(g["candidates"]) - len(rs)
         if len(rs) > 1:
             spreads.append(max(rs) - min(rs))
     return {
@@ -1209,6 +1233,9 @@ def dataset_status(path: str) -> dict:
         # is too coarse to discriminate the candidate grid.
         "zero_spread_groups": sum(1 for s_ in spreads if s_ <= 0),
         "scored_groups": len(spreads),
+        # Candidates with no reward yet (photo logs them when a group is proposed
+        # without scoring); a group needs >= 2 scored candidates to teach anything.
+        "unscored_candidates": unscored,
         **{k: v for k, v in stats.items() if k in
            ("records", "legacy_singletons", "reward_records", "bad_lines")},
     }
@@ -1323,9 +1350,14 @@ def train(dataset: str, identity: str, style: str | None = None, creator: str = 
     for epoch in range(max(1, epochs)):
         n_batches = max(1, (len(train_set) + bs - 1) // bs)
         order = rng.permutation(n_batches)
-        step_metrics = {"loss": 0.0, "groups": 0, "clip_fraction": 0.0,
+        # Two different denominators: the objective's own metrics are per
+        # grpo_loss_and_grads CALL (group x inner step), while grad_norm /
+        # clip_hits are per OPTIMISER STEP (batch). Dividing both by the batch
+        # count reported clip_fraction = 5.9 and groups = 11 in a real run.
+        step_metrics = {"loss": 0.0, "groups": 0.0, "clip_fraction": 0.0,
                         "mean_abs_rho_minus_1": 0.0, "grad_norm": 0.0, "clip_hits": 0.0}
         n_steps = 0
+        n_calls = 0
         for b in order:
             chunk = train_set[b * bs:(b + 1) * bs]
             # GRPO baseline: the ratio reference is frozen for THIS minibatch, not
@@ -1334,7 +1366,9 @@ def train(dataset: str, identity: str, style: str | None = None, creator: str = 
             # inner step the ratio is 1 by construction, so the observed
             # clip_fraction is ~0 (honest: the clip is a safety net for
             # inner_steps > 1, it is not what makes this objective converge).
-            olds = [policy_logits(model, p["X"], temperature)["s"] for p in chunk]
+            # log-probabilities, NOT logits — see the contract on grpo_loss_and_grads
+            olds = [log_softmax(policy_logits(model, p["X"], temperature)["s"])
+                    for p in chunk]
             acc_grads: dict = {}
             for p, old_i in zip(chunk, olds):
                 for _inner in range(max(1, inner_steps)):
@@ -1345,9 +1379,9 @@ def train(dataset: str, identity: str, style: str | None = None, creator: str = 
                                             pref_coef=pref_coef, model_grads_out=grads)
                     for k, v in grads.items():
                         acc_grads[k] = v if k not in acc_grads else acc_grads[k] + v
-                    for k in step_metrics:
-                        if k in m:
-                            step_metrics[k] += m[k]
+                    for k in ("loss", "groups", "clip_fraction", "mean_abs_rho_minus_1"):
+                        step_metrics[k] += m[k]
+                    n_calls += 1
             for k in acc_grads:
                 acc_grads[k] = acc_grads[k] / len(chunk)
             if freeze_style:
@@ -1364,9 +1398,12 @@ def train(dataset: str, identity: str, style: str | None = None, creator: str = 
                 print(f"  epoch {epoch} batch {b}: loss "
                       f"{step_metrics['loss'] / max(1, len(chunk)):+.4f} "
                       f"grad_norm {applied['grad_norm']:.4f}", file=sys.stderr)
+        calls = n_calls or 1
+        for k in ("loss", "groups", "clip_fraction", "mean_abs_rho_minus_1"):
+            step_metrics[k] /= calls
         if n_steps:
-            for k in step_metrics:
-                step_metrics[k] /= n_steps
+            step_metrics["grad_norm"] /= n_steps
+            step_metrics["clip_hits"] /= n_steps
         step_metrics["epoch"] = epoch
         step_metrics["train_rank_acc"] = ranking_accuracy(model, train_set)[0]
         step_metrics["eval_rank_acc"] = ranking_accuracy(model, eval_set)[0]
@@ -1475,10 +1512,14 @@ class TasteScorer:
         d_z = int(meta["editapart.d_z"])
         style_path = style or os.environ.get("DSH_EDITAPART_STYLE") or os.path.join(
             os.path.dirname(os.path.abspath(identity)), str(meta.get("editapart.style_file", "")))
-        if not os.path.exists(style_path):
+        if not os.path.isfile(style_path):
+            # `os.path.exists` accepted a DIRECTORY here: an empty/missing
+            # editapart.style_file resolves to the identity's own directory, which
+            # exists, and the failure surfaced later as IsADirectoryError.
             raise FileNotFoundError(
-                f"style-brain {style_path!r} referenced by {identity!r} is missing; "
-                f"train it (taste_model.py train) or pass --style/DSH_EDITAPART_STYLE")
+                f"style-brain {style_path!r} referenced by {identity!r} is missing or not a "
+                f"file (editapart.style_file={meta.get('editapart.style_file')!r}); train the "
+                f"shared trunk (taste_model.py train) or pass --style/DSH_EDITAPART_STYLE")
         model = StyleBrain(d_in, d_h, d_z)
         style_meta = model.load_shared(style_path)
         digest = model.shared_digest()
@@ -1515,6 +1556,8 @@ class TasteScorer:
             "trained_groups": self.meta.get("editapart.trained_groups"),
             "eval_groups": self.meta.get("editapart.eval_groups"),
             "eval_rank_acc": self.meta.get("editapart.eval_rank_acc"),
+            "created_at": self.meta.get("editapart.created_at"),
+            "trained_at": self.meta.get("editapart.trained_at"),
             "z_u_norm": round(float(np.linalg.norm(self.model.p["z_u"])), 6),
             "z_u": [round(float(v), 6) for v in self.model.p["z_u"]],
             "features": FEATURE_SPECS[self.feature_spec],
@@ -1560,7 +1603,9 @@ def init_identity(identity: str, style: str | None = None, creator: str = "defau
         "editapart.style_frozen": False,
         "editapart.revealed_pref_bonus": 1.0,
         "editapart.trained_groups": 0,
-        "editapart.initialized_at": int(time.time()),
+        # `created_at` (not `initialized_at`): every artifact reports its creation
+        # under one name, and an untrained identity simply carries no `trained_at`.
+        "editapart.created_at": int(time.time()),
     }, {"z_u": model.p["z_u"]})
     return {"ok": True, "identity": identity, "style_brain": style_path,
             "creator": creator, "feature_spec": spec, "z_u": [0.0] * d_z,

@@ -1,0 +1,35 @@
+{
+  "name": "dsh-edit-apart",
+  "version": "0.2.0",
+  "private": false,
+  "description": "EditApart — a taste-driven video + photo editor agent preset for DeepSeek Harness, shipped as an installable plugin bundle.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "agent-preset",
+    "video-editing",
+    "photo-editing"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": [
+        "./cordis.patch.yml"
+      ]
+    }
+  },
+  "files": [
+    "cordis.patch.yml",
+    "plugins/",
+    "bin/",
+    "skills/",
+    "docs/",
+    "tests/",
+    "README.md",
+    "LICENSE",
+    "requirements.txt",
+    "env.sh.example",
+    "setup.sh"
+  ]
+}

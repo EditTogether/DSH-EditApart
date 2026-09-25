@@ -5,3 +5,7 @@
 # numpy<2 to avoid the "KeyError: 'rad2deg'" import crash (see setup.sh).
 scenedetect>=0.7.0,<0.8
 numpy>=1.26,<2.0
+
+# Tests only: tests/test_bundle_packaging.py reads cordis.patch.yml, whose `!!js`
+# scalars need a lenient loader (see the test's module docstring).
+pyyaml>=6.0

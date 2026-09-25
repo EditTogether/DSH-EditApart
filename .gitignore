@@ -1,3 +1,8 @@
+# Node install tree — this repository is also an installable bundle
+# (`dsh plugin add` installs it into a PROFILE, but a contributor may run
+# npm/pnpm install here; nothing in that tree belongs in the package).
+node_modules/
+
 # Python bytecode caches (engines + standalone scripts)
 __pycache__/
 *.py[cod]

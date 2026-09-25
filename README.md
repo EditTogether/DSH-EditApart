@@ -247,40 +247,64 @@ Reproduce with `tests/test_taste_model.py` (35 tests, no media needed) and
 
 ## Install
 
-An EditApart install is one directory in the harness's user-preset root. **The
-directory name is the preset id**, `agent.cordis.yml` is the composition the
-loader owns, and `preset.yml` carries display metadata only — so clone the
-repository under the id you want:
+EditApart ships as a **plugin bundle** that carries an agent preset, and requires
+**DeepSeek Harness ≥ 0.1.7**: since 0.1.7 a preset is an
+`@deepseek-ai/dsh-agent-preset` declaration row supplied by a bundle patch, and the
+older user-preset directory (`$DSH_HOME/.agent-presets/<id>/`) is no longer read.
 
 ```bash
-git clone https://github.com/EditTogether/DSH-EditApart.git ~/.dsh/.agent-presets/ai-video-editor
+dsh plugin --profile web add https://github.com/EditTogether/DSH-EditApart
 ```
 
-Optionally provision the scene-detector/renderer toolchain (a venv, so nothing
-touches your system Python):
+`dsh plugin` runs the profile's package manager, and an installed package that
+declares `dsh.bundle` is activated as a bundle automatically. Restart the harness
+(or open a new session) and pick **EditApart (AI taste editor)** in the mode
+picker.
+
+To use the optional venv toolchain, install from a checkout instead, so the venv
+and `.dshenv` live somewhere you control:
 
 ```bash
-cd ~/.dsh/.agent-presets/ai-video-editor && bash setup.sh
+git clone https://github.com/EditTogether/DSH-EditApart ~/dsh-edit-apart
+cd ~/dsh-edit-apart && bash setup.sh
+dsh plugin --profile web add ~/dsh-edit-apart
 ```
 
-Restart DeepSeek Harness (or open a new session) and pick **EditApart (AI taste
-editor)** in the mode picker. Update with
-`git -C ~/.dsh/.agent-presets/ai-video-editor pull`; uninstall by deleting that
-directory.
+Update with `dsh plugin --profile web update dsh-edit-apart` (or
+`git -C ~/dsh-edit-apart pull` for a checkout); uninstall with
+`dsh plugin --profile web remove dsh-edit-apart`, or through the harness's plugin
+manager.
 
-**Requirements.** The harness you install it into — the composition names only
-plugins the harness already ships, so there are no npm dependencies to add — plus
-`ffmpeg`/`ffprobe` and `scenedetect` for video, and optionally ImageMagick for
-photos. No absolute path is baked in anywhere: toolchains resolve `DSH_*` env →
-`<preset>/.dshenv` → PATH, so a machine-local install is a `.dshenv` (gitignored)
-and never a repository edit.
+**What the bundle declares.** `package.json` points `dsh.bundle.patch` at
+`cordis.patch.yml`, whose single `insert` row is the preset declaration: id
+`ai-video-editor`, the display name/description/order the picker shows, and
+`config.plugins` — the composition that used to be `agent.cordis.yml`. A row's
+specifier resolves against the **profile** directory, so this package's own plugin
+is named by package subpath (`dsh-edit-apart/plugins/edit-apart.mjs`) and its
+method skill is resolved from the profile down into
+`node_modules/dsh-edit-apart/skills/`. No shipped file contains a machine-local
+path, and `tests/test_bundle_packaging.py` fails if one reappears, if a relative
+row specifier creeps back in, or if this section stops showing the real command.
 
-**Verified as installed.** Running the harness's own preset discovery against a
-plain `git clone` of this repository reports id `ai-video-editor`, name
-"EditApart (AI taste editor)", and **no `broken` verdict** — every plugin row in
-the composition resolves against the runtime's package base. Both files must stay
-at the repository root: a directory whose `agent.cordis.yml` is missing still
-occupies its id and shows as broken rather than mounting.
+**Requirements.** Only what the harness already ships — the composition names
+harness plugins and adds no npm dependencies — plus `ffmpeg`/`ffprobe` and
+`scenedetect` for video, and optionally ImageMagick for photos. Toolchains resolve
+`DSH_*` env → `<preset>/.dshenv` → PATH, so a machine-local install is a `.dshenv`
+(gitignored) and never a repository edit.
+
+**Verified as installed** (harness 0.1.7-rc.2, throwaway profile):
+
+| Check | Result |
+| --- | --- |
+| `dsh plugin --profile bundlecheck add <repo>` | installed, and `dsh.profile.bundles` gains `dsh-edit-apart` automatically |
+| `dsh --profile bundlecheck --dump-config` | exit 0, composed tree contains the `preset-edit-apart` → `@deepseek-ai/dsh-agent-preset` row with `config.id: ai-video-editor` |
+| the plugin row's specifier, resolved *from the profile* | resolves to the package's own `plugins/edit-apart.mjs`, which imports and exports `apply` |
+| the skills expression, evaluated against the profile | `<profile>/node_modules/dsh-edit-apart/skills/edit-apart/SKILL.md` exists |
+| the live registry's `entryListProblem` over all 17 child rows | OK — the shipped `standard` preset returns the same verdict |
+
+Not separately verified: a cold-session *mount* of this freshly installed preset
+(the declaration mechanism is the one the live profile already mounts presets
+with).
 
 This project is discoverable in the DeepSeek Harness ecosystem under the
 [`dsh-plugin`](https://github.com/topics/dsh-plugin) topic.
@@ -338,11 +362,12 @@ Taste-model keys: `DSH_EDITAPART_IDENTITY` (per-creator GGUF),
 (candidates per proposal, default 4). The identity and the log are per-workspace
 on purpose, so each project accumulates its own creator history.
 
-> The plugin is **import-free** on purpose: a user-preset relative-mounted
-> module cannot import `@deepseek-ai/*` (its internal imports resolve against
-> the preset dir, not the harness). It hand-builds `ToolDefinition`s and calls
+> The plugin is **import-free** on purpose: a preset row's specifier resolves
+> against the profile directory, where the harness's own `@deepseek-ai/*` packages
+> are not resolvable. It hand-builds `ToolDefinition`s and calls
 > `ctx.tools.register()`, shelling out to `bin/edit_apart_core.py` /
-> `bin/photo_core.py`.
+> `bin/photo_core.py` (found as siblings of the plugin file, so the whole package
+> travels together).
 
 ## Trust & security
 
@@ -444,6 +469,18 @@ here, and the behavioural numbers this README reports were re-measured afterward
    "render a different candidate than the selected one" workflow requires — and the
    test asserts the logged reward is the picked candidate's.
 
+**Packaging correction (harness 0.1.7).** The previous version of this README
+told users to clone the repository into `$DSH_HOME/.agent-presets/<id>/`. That
+layout was retired in 0.1.7, where a preset is an `@deepseek-ai/dsh-agent-preset`
+declaration row carried by a bundle patch — so the instruction installed files
+nothing reads, and the "verified as installed" check that accompanied it passed
+only because it exercised the package that implemented the retired mechanism.
+The repository is now a bundle (`package.json` → `dsh.bundle.patch` →
+`cordis.patch.yml`) installed with `dsh plugin add`; `agent.cordis.yml` and
+`preset.yml` are gone, and the check that could not have caught this has been
+replaced by `tests/test_bundle_packaging.py` plus the real scratch-profile install
+in the table under **Install**.
+
 Smaller fixes from the same review: schema values that reach the ffmpeg
 filtergraph are validated (`_num`/`_ff_crop`), `revise` no longer `KeyError`s on a
 schema without `meta`, photo `temperature` actually renders (it was
@@ -454,10 +491,19 @@ empty `style_file` no longer resolves to a directory.
 ## Verification
 
 ```bash
-# model + video loop unit suite: 36 tests, no media required (~25s)
+# packaging contract: bundle manifest, preset declaration, specifier forms and
+# the no-machine-local-paths rule (needs PyYAML; <1s)
+~/dsh-edit-venv/bin/python tests/test_bundle_packaging.py -v
+
+# model + video loop unit suite: 42 tests, no media required (~25s)
 ~/dsh-edit-venv/bin/python tests/test_taste_model.py -v
 
-# photo taste suite: 23 tests (feature tests need no renderer; the grouped and
+# environment conformance: prove THIS install's renderer/prober can support the
+# loop before trusting a logged group (both cores ship one)
+python bin/photo_core.py selftest
+python bin/edit_apart_core.py selftest          # needs scenedetect on PATH/DSH_SCENEDETECT
+
+# photo taste suite: 35 tests (feature tests need no renderer; the grouped and
 # per-creator tests need ImageMagick; ~4 min, dominated by candidate renders)
 ~/dsh-edit-venv/bin/python tests/test_photo_taste.py -v
 
@@ -467,6 +513,9 @@ DSH_SCENEDETECT=~/dsh-edit-venv/bin/scenedetect \
 DSH_EDITAPART_E2E_SRC=/path/to/footage.mp4 \
 ~/dsh-edit-venv/bin/python tests/test_loop_e2e.py -v
 ```
+
+The video E2E suite also renders a muted clip (the audio fallback) and rejects a
+hostile `crop`/`scale` value with a clear error.
 
 The unit suite checks Newton-Schulz's bounded band and scale invariance, the
 optimizer split (Muon never sees a 1D gradient, AdamW never sees a 2D one),

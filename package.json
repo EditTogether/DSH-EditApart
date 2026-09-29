@@ -1,8 +1,9 @@
 {
   "name": "dsh-edit-apart",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": false,
   "description": "EditApart — a taste-driven video + photo editor agent preset for DeepSeek Harness, shipped as an installable plugin bundle.",
+  "main": "./plugins/edit-apart.mjs",
   "type": "module",
   "license": "MIT",
   "keywords": [

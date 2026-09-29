@@ -275,8 +275,14 @@ Update with `dsh plugin --profile web update dsh-edit-apart` (or
 `dsh plugin --profile web remove dsh-edit-apart`, or through the harness's plugin
 manager.
 
-**What the bundle declares.** `package.json` points `dsh.bundle.patch` at
-`cordis.patch.yml`, whose single `insert` row is the preset declaration: id
+**What the bundle declares.** `package.json` declares `main` =
+`./plugins/edit-apart.mjs` — a bundle is judged loadable by its declared entry
+artifact (the plugin market reads `main`, then `exports`, else looks for
+`index.js`, and reports "the declared entry artifact is missing (source-only
+checkout or blocked build) — the next boot would fail" when it finds none), and
+this package's loadable entry is exactly the module the preset mounts. It also
+points `dsh.bundle.patch` at `cordis.patch.yml`, whose single `insert` row is the
+preset declaration: id
 `ai-video-editor`, the display name/description/order the picker shows, and
 `config.plugins` — the composition that used to be `agent.cordis.yml`. A row's
 specifier resolves against the **profile** directory, so this package's own plugin
@@ -284,7 +290,8 @@ is named by package subpath (`dsh-edit-apart/plugins/edit-apart.mjs`) and its
 method skill is resolved from the profile down into
 `node_modules/dsh-edit-apart/skills/`. No shipped file contains a machine-local
 path, and `tests/test_bundle_packaging.py` fails if one reappears, if a relative
-row specifier creeps back in, or if this section stops showing the real command.
+row specifier creeps back in, if the declared entry artifact goes missing, or if
+this section stops showing the real command.
 
 **Requirements.** Only what the harness already ships — the composition names
 harness plugins and adds no npm dependencies — plus `ffmpeg`/`ffprobe` and

@@ -95,6 +95,26 @@ class TestBundlePackaging(unittest.TestCase):
         self.assertEqual(patch, ["./cordis.patch.yml"])
         self.assertTrue(os.path.isfile(PATCH), "declared patch file is missing")
 
+    def test_declares_a_loadable_entry_artifact(self):
+        """A bundle with no declared entry artifact is reported as broken.
+
+        dshmarket's `entryArtifactExists()` (lib/profile.js) reads `main`, then the
+        root `exports`, then falls back to `index.js` — so a source-only checkout
+        that declares none of them is reported as "the declared entry artifact is
+        missing (source-only checkout or blocked build) — the next boot would
+        fail". This package's loadable entry IS its plugin, and it has to say so.
+        """
+        main = self.manifest.get("main")
+        self.assertIsInstance(
+            main, str,
+            "no `main`/`exports` → the market looks for a nonexistent index.js and flags the bundle")
+        self.assertTrue(os.path.isfile(os.path.join(ROOT, main.lstrip("./"))),
+                        f"the declared entry artifact {main!r} does not exist")
+        row = next(r for r in _composition(self.patch) if r["id"] == "edit-apart")
+        subpath = row["name"].split("/", 1)[1] if "/" in row["name"] else row["name"]
+        self.assertEqual(os.path.normpath(subpath), os.path.normpath(main.lstrip("./")),
+                         "the declared entry must be the module the preset actually mounts")
+
     # ── the declaration row ─────────────────────────────────────────────────
 
     def test_patch_declares_exactly_one_agent_preset(self):
@@ -145,9 +165,14 @@ class TestBundlePackaging(unittest.TestCase):
     def test_no_machine_local_paths_anywhere(self):
         """Nothing a user receives may carry a path from a development machine."""
         offenders = []
+        # The file-URL scheme is ASSEMBLED, not written literally: this test file
+        # is itself shipped (and therefore scanned by the loop below), so a literal
+        # occurrence here would flag the checker instead of the payload. No
+        # exemption list, so a real machine-local path in this file is still caught.
+        file_url = "file:" + "/" * 3
         patterns = (re.compile(r"/home/[A-Za-z0-9._-]+/", re.I),
                     re.compile(r"/Users/[A-Za-z0-9._-]+/"),
-                    re.compile(r"file:///", re.I),
+                    re.compile(file_url, re.I),
                     re.compile(r"[A-Za-z]:\\\\?(?:Users|Documents|dev)\\\\", re.I))
         for rel in _tracked_files():
             if rel.endswith((".png", ".jpg", ".mp4", ".gguf", ".pdf")):

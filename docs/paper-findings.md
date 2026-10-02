@@ -85,6 +85,30 @@ input. The corollary is a logging rule: the loop has to record which output the
 user actually chose, because that record is the only user-dependent variable the
 objective can access.
 
+**Concurrent work (added 2026-09).** This is not a novel observation any more.
+[*Crayotter: Learning Long-Horizon Video Editing Agents via Group-Relative Preference
+Backpropagation*](https://arxiv.org/abs/2608.02694) (arXiv:2608.02694, Aug 2026) states
+the same premise — a global scalar over subjective edits is ambiguous, so fix the
+request/materials/constraints and the objective becomes an ordinal comparison among
+directly comparable alternatives — and builds GRPB on it, with two mechanisms this
+design lacked: **bounded credit redistributed over semantic editing segments**, and a
+**lagged allocator with guarded transmission** so current judgments do not shape the
+same rollout group.
+
+Two consequences for the claims above. First, **the novelty claim narrows** to the
+mechanism (a per-creator latent against a digest-verified frozen trunk; deterministic
+candidate groups as the comparison set; an objective critic; a selector rather than a
+fine-tuned model) rather than to the idea of group-relative learning on edit decisions.
+Second, one of GRPB's guards is now implemented here, because this loop had the same
+leak in a different place: the preference term and the revealed-preference bonus used to
+accept **any** logged pick, including one the system made itself (the identity's own
+selection, or the objective critic's). A system-made choice is the model's own judgment,
+so training on it is self-confirmation, not evidence about the creator. Picks are now
+tagged by provenance — `creator|agent|human` (external) versus `taste|critic` (system) —
+and only external judgments train the preference term or take the bonus; the guard is
+pinned by `tests/test_taste_model.py::TestPreferenceProvenance`. Segment-local credit is
+designed in `docs/expansion-plan.md`, not yet implemented.
+
 ### Finding 1b — the methodological lesson: a negative ablation can be an artifact of adapter capacity
 
 Our first ablation of this question reached the **opposite** conclusion —

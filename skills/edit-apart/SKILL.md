@@ -39,7 +39,11 @@ matching `DSH_*` variable (`DSH_FFMPEG`, `DSH_FFPROBE`, `DSH_SCENEDETECT`,
    underspecified taste. The group is logged automatically; the selected
    candidate is the identity's argmax when an identity exists, else the best
    objective reward. **If you or the creator prefers a DIFFERENT candidate than
-   the selected one, render that one and log it with `chosen_by=creator|agent`.**
+   the selected one, render that one and log it with `chosen_by=creator|agent`.
+   If instead the IDENTITY's own selection is what got rendered, log
+   `chosen_by=taste`** — a choice the system made is not a revealed preference and
+   must not be reported as one (only `creator`/`agent`/`human` train the taste
+   model; `critic` means nobody picked, the objective critic just scored it).
 4. **Render** — deterministic ffmpeg graph from the schema (see renderer).
 5. **Critique** — pass the group id and candidate index so the reward lands on
    the candidate that was actually rendered (`chosen_by=creator|agent` when the
@@ -295,10 +299,27 @@ fine-tuned language model.
   step (this is what `propose_schema group=K` + `train_identity` do for real).
   Interleave **self-play** (the deterministic candidate grid) with **history**
   (the creator's logged prior edits).
+- **Effects are decisions too.** Log groups with `feature_spec=video/v2` when the
+  edit has multi-input effects worth learning (transitions, ducking, grading,
+  overlays): the v1 layout cannot see any of them, so a v1-logged group can never
+  teach an effect preference. Propose those groups with `effect_grid=true` so the
+  candidates actually differ in the effects — otherwise a pick teaches nothing about
+  them. Once an identity is trained on v2, propose with
+  `refine=N` and the identity chooses the effect parameters themselves
+  (transition type/duration/alignment, duck depth, grade strength) instead of only
+  ranking fixed candidates. It declines with a reason if the identity is v1.
 - **Revealed preference must be in the objective.** When the creator or the agent
   renders a candidate that is *not* the one the objective reward prefers, log
   `critic_edit … chosen_by=creator|agent`. That pick becomes the group's top
-  reward and a preference term in the loss. A rubric-derived reward alone cannot
+  reward and a preference term in the loss. **Provenance is load-bearing:**
+  `chosen_by=taste` (the identity selected it) and `chosen_by=critic` (nobody
+  picked) are the SYSTEM's own judgment, so they train neither the preference
+  term nor the bonus — this is the local form of the "guarded transmission" rule
+  in group-relative preference learning (Crayotter, arXiv:2608.02694): a group's
+  own judgment must not be fed back as that group's label. They still learn
+  through the group-relative advantage over the critic's rewards, which is a
+  measurement of the edit rather than a claim about the creator. A
+  rubric-derived reward alone cannot
   identify per-user taste: with no user-dependent term, two creators with
   opposite tastes differ on only **4/12** neutral briefs (p ≈ 0.21 against the
   unrelated-picks null), versus **8/12** (p ≈ 0.0006) with it. The reward override
@@ -382,6 +403,9 @@ The persona and tool catalog already describe them; prefer these over running
 - Do not use Muon on the identity latent (or on any 1D parameter).
 - Do not drop `chosen_by=creator|agent` when a human/agent pick overrode the
   objective winner — that flag is the taste signal.
+- Do not log `chosen_by=agent` when the identity's own selection was simply
+  accepted. That is `taste`, and mislabelling it turns the model's own preference
+  into fake evidence for itself (it will happily confirm it).
 - Do not call `train_identity` and then present the artifact as "trained taste"
   without the held-out numbers; report the accuracy or say it is untrained.
 - Do not reuse a video identity for photos (or vice versa): the layouts differ

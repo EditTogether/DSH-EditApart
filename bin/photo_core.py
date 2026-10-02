@@ -860,8 +860,13 @@ def main() -> int:
     p.add_argument("--dataset", default=os.getenv("DSH_EDITAPART_DATASET"))
     p.add_argument("--group-id", default=None)
     p.add_argument("--candidate", type=int, default=0)
-    p.add_argument("--chosen-by", choices=["critic", "creator", "agent", "human"],
-                   default="critic")
+    p.add_argument("--chosen-by", choices=["critic", "creator", "agent", "human", "taste"],
+                   default="critic",
+                   help="who picked this candidate. creator/agent/human is an external "
+                        "judgment (a revealed preference that trains the taste model); "
+                        "taste means the identity's own selection was rendered — the "
+                        "system's own choice, excluded from the preference term; critic "
+                        "means only the objective critic scored the group.")
     p = sub.add_parser("revise"); p.add_argument("schema"); p.add_argument("critic")
 
     p = sub.add_parser("taste_train")

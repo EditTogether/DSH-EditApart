@@ -158,7 +158,15 @@ its endpoints — asserted in the test suite).
 dense reward. GRPO turns that into group-relative advantages
 `A_k = (r_k − mean r)/std r`, and the update is a PPO-clip surrogate on the
 group-softmax selection policy, plus an auxiliary pairwise preference loss over
-the pick that was actually rendered and a small entropy bonus. Utilities are
+the pick that was actually rendered and a small entropy bonus — **but only when the
+pick came from an external judge** (`chosen_by=creator|agent|human`). A choice the
+system itself made (`taste`: the identity's selection was rendered; `critic`: nobody
+picked, the objective critic only scored) trains neither the preference term nor the
+reward bonus. It still learns through the group-relative advantage over the critic's
+rewards, which measures the edit rather than claiming anything about the creator. The
+loop therefore records **who** picked, not just what was picked; `taste_status` reports
+how many groups were excluded for this reason. (If the group record and the later
+reward record disagree, the reward record — the engine's own flow — wins.) Utilities are
 standardised *within* the candidate group before the softmax: this keeps the
 logits responsive so the latent can always reorder candidates — with an
 unbounded-then-squashed output the utilities saturate under the margin objective
@@ -210,6 +218,57 @@ vs +7.0…+9.4 s). The override additionally fits the creator's own corpus far
 better than the auxiliary loss (0.83/1.00 vs 0.22/0.26), so both mechanisms are
 kept; `tests/experiment_revealed_preference.py` reproduces the whole table.
 
+### Multi-input effects (the v2 layout)
+
+The v1 feature layout describes the **resulting cut sequence** — shot counts and
+durations, cuts per minute, pace band, motion, coverage, order, luminance, audio RMS.
+A transition, a grade, ducking and an overlay are decisions about **how inputs
+combine** (a transition joins two clips, ducking relates speech to music, an overlay
+composites layers), and none of them appears in that list. So with v1 the identity
+could only choose *which selection* to use; it could not set an effect's parameters at
+all. That is a real limitation, not a detail: an NLE-shaped editor is mostly effects.
+
+`video/v2` adds ten effect-parameter features (transition fraction, duration,
+alignment and asymmetry; grade deviation; LUT; reframe; duck depth; segment gain;
+overlay fraction) under a **new spec id** — never an edit of v1, because the layout list
+is part of an artifact's digest, so a v1 identity keeps loading and keeps refusing a v2
+trunk instead of being silently reinterpreted with shifted columns. A log may hold both;
+the majority layout trains and the rest are counted (`groups_other_spec`), since mixing
+vector layouts would either crash the first forward pass or mis-align columns.
+
+Two halves are needed, and both exist: **a group that spans effects**, so a preference
+can be *learned* — `propose_schema(… effect_grid=true)` pairs the selection grid with
+effect knobs (the default grid varies selection only, so every candidate in a legacy
+group agrees on every effect feature and nothing could ever teach an effect
+preference) — and **an identity that can *choose*** them:
+`propose_schema(… refine=N)` runs a deterministic coordinate ascent over
+the effect axes (transition type/duration/alignment, ducking, grade strength) scored by
+the identity, and the tuned schema joins the group as one more candidate. Two
+properties are deliberate:
+
+- **It needs an effect-aware identity.** A v1 trunk has 16 inputs and cannot score a
+  26-dim vector, so the request is *declined with a reason* rather than silently
+  ignored — and the feature spec a group is logged under is explicit
+  (`--feature-spec`), because a group logged under v1 can never teach an effect.
+- **No identity means no effect taste.** `refine_effects` with no scorer returns the
+  schema untouched: with no identity there is no taste to apply, and maximising the
+  objective critic there would quietly turn a rubric rule into a taste claim.
+
+Measured (`tests/test_taste_model.py::TestEffectTaste`): groups are logged under v2
+with a reward that rises only with the transition duration — a hidden preference
+expressed *solely* through an effect parameter — an identity is trained on it
+(`train_rank_acc` ≥ 0.8), and the refiner then chooses a dissolve and pushes the
+duration past 0.8 s from an all-cuts seed. The control run with no identity changes
+nothing. `TestEffectFeatures` pins the blindness of v1, the superset relation and the
+mixed-spec rule.
+
+**Not yet done, and worth naming:** credit is still per *candidate*, not per *effect* —
+the group-relative advantage is broadcast over the whole timeline rather than attributed
+to the effect that changed (the segment-local-credit design in
+[`docs/expansion-plan.md`](docs/expansion-plan.md)); the effect axes are a fixed grid
+rather than continuous optimisation; and effects carry no provenance of their own beyond
+the pick provenance described above.
+
 ### Measured results
 
 | Claim | Measurement |
@@ -225,8 +284,42 @@ kept; `tests/experiment_revealed_preference.py` reproduces the whole table.
 | The repair is partial and content-driven | 4-arm transfer experiment (re-measured): only the 3-image/narrow-family arm transferred to an unseen image+geometry (tight/loose ratio **0.400**) while A1/A2/B2 showed no effect (1.000); on a *seen* image at the same geometry three of four arms did separate. The ±0.36 ordering-metric noise floor from the no-taste control is a pre-fix measurement |
 | The loop is numpy-optional | legacy `propose group=1` and group logging work with numpy blocked; only the model path errors |
 
-Reproduce with `tests/test_taste_model.py` (35 tests, no media needed) and
+Reproduce with `tests/test_taste_model.py` (52 tests, no media needed) and
 `tests/test_loop_e2e.py` (real footage; see **Verification**).
+
+### Concurrent work (2026-09)
+
+Group-relative preference learning on edit decisions is **not unprecedented**, and the
+honest version of this project's positioning says so:
+
+- **Crayotter: GRPB** — [*Learning Long-Horizon Video Editing Agents via
+  Group-Relative Preference Backpropagation*](https://arxiv.org/abs/2608.02694) (Aug
+  2026) makes the same core observation this project's Finding 1 measures: a global
+  scalar objective over subjective edits is ambiguous and temporally uninformative, and
+  fixing the request/materials/constraints turns it into an *ordinal comparison among
+  directly comparable alternatives*, whose same-task rankings become zero-sum
+  advantages. It goes further in two ways this repository has now partly adopted:
+  credit **localised to semantic editing segments**, and a **lagged allocator / guarded
+  transmission** so a group's own judgment never trains that group. The provenance rule
+  above is the local form of the guard; segment-local credit is designed in
+  [`docs/expansion-plan.md`](docs/expansion-plan.md) but not yet implemented.
+- **ReelBrain** ([Q00/ReelBrain](https://github.com/Q00/ReelBrain)) reaches the same
+  governance conclusion from the product side: a learned taste profile is a
+  **behavioural prior, never evidence** about the footage, and explicit current
+  steering always overrides stored taste.
+- The agent-drivable NLE and headless-montage layers (OpenChatCut, Timeline Studio,
+  cutible and others) have commoditised timeline-as-data, diffs, deterministic render,
+  MCP surfaces, dry-runs and predicted diffs — see
+  [`docs/state-of-the-art-2026-09.md`](docs/state-of-the-art-2026-09.md) for the survey
+  and the gap analysis, including the interop facts verified first-hand with
+  `tools/otio_conformance.py`.
+
+What remains distinctive here is narrower and stated as such: a **per-creator latent**
+(~1 KB, against a frozen shared trunk whose digest the artifact carries) rather than a
+prompt profile or a fine-tuned model; the decision object serving as render input,
+critique target **and** training datum; **system-generated candidate groups** as an
+auditable comparison set; an **objective, recomputable critic**; and the trained policy
+as the *selector*, not the language model.
 
 ### Boundaries (honest)
 
@@ -502,7 +595,7 @@ empty `style_file` no longer resolves to a directory.
 # the no-machine-local-paths rule (needs PyYAML; <1s)
 ~/dsh-edit-venv/bin/python tests/test_bundle_packaging.py -v
 
-# model + video loop unit suite: 42 tests, no media required (~25s)
+# model + video loop unit suite: 52 tests, no media required (~25s)
 ~/dsh-edit-venv/bin/python tests/test_taste_model.py -v
 
 # environment conformance: prove THIS install's renderer/prober can support the

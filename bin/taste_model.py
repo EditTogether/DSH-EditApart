@@ -20,6 +20,14 @@ Design contract (see the `edit-apart` skill, "Taste model" section):
     group first, so the logits stay responsive and the latent keeps the ability
     to reorder candidates. A pick logged with `chosen_by=creator|agent` is a
     REVEALED preference and becomes that group's top reward.
+    Only an EXTERNAL judgment may do that. A pick the system itself made — the
+    objective critic (`chosen_by=critic`) or the identity's own selection
+    (`chosen_by=taste`) — is not evidence about the creator's taste, so it is
+    excluded from the preference term and from the reward bonus while still
+    training through the group-relative advantage (see EXTERNAL_JUDGES). This is
+    the local form of the "guarded transmission / lagged allocator" rule in
+    group-relative preference learning: a group's own judgment must not be fed
+    back as a label for that same group.
   * Optimizer split: Muon (Newton-Schulz orthogonalized momentum) on the shared
     2D weight matrices; AdamW on `z_u` and every 1D/bias parameter. Muon must
     never touch a 1D parameter.
@@ -118,7 +126,35 @@ PHOTO_FEATURES = [
     "bias",             # constant 1.0
 ]
 
-FEATURE_SPECS = {FEATURE_SPEC_VIDEO: VIDEO_FEATURES, FEATURE_SPEC_PHOTO: PHOTO_FEATURES}
+#: Effect-parameter features: the "MIMO" half of an edit. Everything the v1
+#: layout measures is a property of the *resulting cut sequence*, and the candidate
+#: grid only varies shot selection — so with v1 alone the identity can choose WHICH
+#: selection to use but cannot set an effect's parameters. A transition joins two
+#: clips, ducking relates speech to music, a grade transforms a clip and an overlay
+#: composites layers: none of those is a property of a single shot.
+VIDEO_EFFECT_FEATURES = [
+    "transition_frac",              # boundaries with a non-cut transition / boundaries
+    "transition_dur_mean",          # mean transition duration / 2s (0 when all cuts)
+    "transition_align_center_frac", # share of transitions centred on the cut
+    "transition_asym_mean",         # mean |in-offset - out-offset| / duration
+    "grade_dev_mean",               # mean |brightness|+|contrast|+|saturation-1|, /3
+    "lut_frac",                     # share of segments carrying a LUT
+    "reframe_frac",                 # share of segments with a non-identity transform
+    "duck_depth_mean",              # mean audio duck depth
+    "gain_db_mean",                 # mean segment gain in dB, /24 (signed)
+    "overlay_frac",                 # share of segments carrying an overlay
+]
+
+#: A NEW spec id, never an edit of v1: the layout list is part of an artifact's
+#: digest, so an identity trained on v1 keeps working (and keeps refusing a v2
+#: trunk) instead of being silently reinterpreted with shifted columns.
+FEATURE_SPEC_VIDEO_V2 = "video/v2"
+
+FEATURE_SPECS = {
+    FEATURE_SPEC_VIDEO: VIDEO_FEATURES,
+    FEATURE_SPEC_VIDEO_V2: VIDEO_FEATURES + VIDEO_EFFECT_FEATURES,
+    FEATURE_SPEC_PHOTO: PHOTO_FEATURES,
+}
 
 # Pace bands, identical to the table the objective critic uses. Kept in sync on
 # purpose: a feature must describe the same notion of "in band" the reward uses.
@@ -341,9 +377,87 @@ def features_photo(schema: dict, inspect: dict, rubric: dict) -> dict:
     }
 
 
+def features_video_v2(schema: dict, inventory: dict, rubric: dict) -> dict:
+    """The v1 cut-sequence features plus the effect-parameter features.
+
+    Deterministic and dependency-free, like `features_video`: it reads the schema
+    the renderer will execute, so a feature and the picture it describes cannot
+    drift apart. Missing/ill-typed values fall back to the schema's own defaults
+    (level 1.0, saturation 1.0, alignment "center") rather than raising — a
+    hand-authored schema must not make a whole dataset unreadable.
+    """
+    feats = features_video(schema, inventory, rubric)
+    segs = [s for s in (schema.get("structure") or []) if isinstance(s, dict)]
+    n = len(segs)
+    if n == 0:
+        feats.update({name: 0.0 for name in VIDEO_EFFECT_FEATURES})
+        return feats
+
+    def _f(value, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    transitions = []
+    for seg in segs:
+        tr = seg.get("transition") or {}
+        if tr.get("type") not in (None, "", "cut"):
+            transitions.append(tr)
+    boundaries = max(1, n - 1)
+
+    durations, centred, asym = [], 0, []
+    for tr in transitions:
+        dur = _f(tr.get("dur"), 0.0)
+        durations.append(dur)
+        params = tr.get("params") or {}
+        if str(params.get("alignment") or "center") == "center":
+            centred += 1
+        if "in" in params or "out" in params:
+            asym.append(abs(_f(params.get("in"), 0.0) - _f(params.get("out"), 0.0))
+                        / max(1e-6, dur))
+
+    grade_devs, luts, reframes, ducks, gains, overlays = [], 0, 0, [], [], 0
+    for seg in segs:
+        grade = seg.get("grade") or {}
+        eq = grade.get("eq") or {}
+        dev = abs(_f(eq.get("brightness"), 0.0)) + abs(_f(eq.get("contrast"), 0.0)) \
+            + abs(_f(eq.get("saturation"), 1.0) - 1.0)
+        grade_devs.append(dev / 3.0)
+        if grade.get("lut"):
+            luts += 1
+        tf = seg.get("transform") or {}
+        if (abs(_f(tf.get("scale"), 1.0) - 1.0) > 1e-9 or tf.get("crop")
+                or tf.get("position")):
+            reframes += 1
+        audio = seg.get("audio") or {}
+        ducks.append(_f(audio.get("duck"), 0.0))
+        level = _f(audio.get("level"), 1.0)
+        gains.append(0.0 if level <= 0 else 20.0 * math.log10(level))
+        if seg.get("overlay"):
+            overlays += 1
+
+    feats.update({
+        "transition_frac": min(1.5, len(transitions) / boundaries),
+        "transition_dur_mean": min(1.5, (sum(durations) / len(durations) / 2.0)
+                                   if durations else 0.0),
+        "transition_align_center_frac": (centred / len(transitions)) if transitions else 0.0,
+        "transition_asym_mean": min(1.5, (sum(asym) / len(asym)) if asym else 0.0),
+        "grade_dev_mean": min(1.5, sum(grade_devs) / n),
+        "lut_frac": luts / n,
+        "reframe_frac": reframes / n,
+        "duck_depth_mean": min(1.5, sum(ducks) / n),
+        "gain_db_mean": max(-1.5, min(1.5, (sum(gains) / n) / 24.0)),
+        "overlay_frac": overlays / n,
+    })
+    return feats
+
+
 def features_for(spec: str, schema: dict, inventory: dict, rubric: dict) -> dict:
     if spec == FEATURE_SPEC_VIDEO:
         return features_video(schema, inventory, rubric)
+    if spec == FEATURE_SPEC_VIDEO_V2:
+        return features_video_v2(schema, inventory, rubric)
     if spec == FEATURE_SPEC_PHOTO:
         return features_photo(schema, inventory, rubric)
     raise ValueError(f"unknown feature spec {spec!r} (known: {sorted(FEATURE_SPECS)})")
@@ -994,7 +1108,11 @@ def grpo_loss_and_grads(model: StyleBrain, groups: list[dict],
         # outcome enters the model even when full-group rewards are sparse).
         pref_loss = 0.0
         chosen = grp.get("chosen")
-        if pref_coef and chosen is not None and X.shape[0] > 1:
+        # `pref_eligible` is set by build_training_arrays from the pick's
+        # provenance. Hand-built groups default to True (they are assumed to
+        # carry an external judgment); the engine path always sets it explicitly.
+        if pref_coef and chosen is not None and X.shape[0] > 1 \
+                and grp.get("pref_eligible", True):
             others = [j for j in range(X.shape[0]) if j != chosen]
             if others:
                 d = s[chosen] - s[others]
@@ -1040,6 +1158,15 @@ def grpo_loss_and_grads(model: StyleBrain, groups: list[dict],
 # ---------------------------------------------------------------------------
 # dataset folding: the loop writes append-only JSONL, training reads groups
 # ---------------------------------------------------------------------------
+#: Who counts as an external judge of an edit. A pick logged with one of these
+#: may train the auxiliary preference term and take the revealed-preference reward
+#: bonus; anything else (`critic`, `taste`) is the system's own judgment and is
+#: therefore excluded from both. Where a system pick IS the only signal, it still
+#: shapes learning through the group-relative advantage over critic-derived
+#: rewards — which is a measurement of the edit, not a claim about the creator.
+EXTERNAL_JUDGES = ("creator", "agent", "human")
+
+
 def load_groups(path: str) -> tuple[list[dict], dict]:
     """Fold the loop's append-only log into training groups.
 
@@ -1093,7 +1220,13 @@ def load_groups(path: str) -> tuple[list[dict], dict]:
                 gid = str(rec.get("group_id") or f"g{len(order)}")
                 g = {"group_id": gid, "clip_id": rec.get("clip_id"),
                      "feature_spec": rec.get("feature_spec", FEATURE_SPEC_VIDEO),
-                     "chosen": None, "chosen_by": None, "candidates": []}
+                     "chosen": None,
+                     # Provenance can arrive on the group record OR (in the engine's
+                     # own flow) on the later `reward` record; the reader used to
+                     # accept only the latter, so a group record carrying `chosen_by`
+                     # had its provenance silently dropped and fell back to
+                     # "no external judgment".
+                     "chosen_by": rec.get("chosen_by"), "candidates": []}
                 for c in rec.get("candidates", []):
                     # The photo engine writes reward_obj: null for unscored
                     # candidates; `float(None)` used to abort the whole log file.
@@ -1152,11 +1285,19 @@ def build_training_arrays(path: str, lambda_dense: float = 1.0,
                 rewards.append(c.get("reward"))
         chosen = g.get("chosen")
         chosen_by = g.get("chosen_by")
+        # A pick the SYSTEM made is not a revealed preference. `taste` means the
+        # identity's own selection was rendered and `critic` means only the
+        # objective critic scored the group; neither may train the preference
+        # term or take the bonus below.
+        pref_eligible = chosen_by in EXTERNAL_JUDGES
+        if chosen is not None and not pref_eligible:
+            stats["groups_pref_ineligible"] = stats.get("groups_pref_ineligible", 0) + 1
+            stats[f"picks_by_{chosen_by or 'none'}"] = \
+                stats.get(f"picks_by_{chosen_by or 'none'}", 0) + 1
         # A revealed pick OUTRANKS whatever was scored, and it can also supply the
         # reward of a candidate nobody scored — that is the point of a revealed
         # preference. With no scores at all it becomes the group's only signal.
-        if (chosen is not None and 0 <= chosen < len(rewards)
-                and chosen_by in ("creator", "agent", "human")):
+        if (chosen is not None and 0 <= chosen < len(rewards) and pref_eligible):
             known = [r for r in rewards if r is not None]
             base = max(known) if known else 0.0
             rewards[chosen] = base + float(revealed_pref_bonus)
@@ -1174,12 +1315,28 @@ def build_training_arrays(path: str, lambda_dense: float = 1.0,
         prepared.append({"group_id": g["group_id"], "clip_id": g["clip_id"], "spec": spec,
                          "X": X, "rewards": r, "A": group_advantage(r),
                          "chosen": (idxs.index(chosen) if chosen in idxs else None),
-                         "chosen_by": chosen_by})
+                         "chosen_by": chosen_by, "pref_eligible": bool(pref_eligible)})
+    # One model has ONE input layout. A log may hold groups logged under different
+    # feature specs (v1 groups and v2 groups coexist by design), and mixing vector
+    # layouts would either crash the first forward pass or — worse — silently
+    # mis-align columns. The majority spec trains; the rest are counted.
+    if prepared:
+        counts: dict[str, int] = {}
+        for item in prepared:
+            counts[item["spec"]] = counts.get(item["spec"], 0) + 1
+        majority = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+        kept = [item for item in prepared if item["spec"] == majority]
+        if len(kept) != len(prepared):
+            stats["groups_other_spec"] = len(prepared) - len(kept)
+            stats["specs_seen"] = sorted(counts)
+        stats["train_spec"] = majority
+        prepared = kept
     stats["groups_total"] = len(prepared) + stats.get("groups_singleton", 0) \
         + stats.get("groups_unscored", 0)
     stats["groups_usable"] = len(prepared)
     stats.setdefault("groups_singleton", 0)
     stats.setdefault("groups_unscored", 0)
+    stats.setdefault("groups_pref_ineligible", 0)
     return prepared, stats
 
 
@@ -1372,7 +1529,8 @@ def train(dataset: str, identity: str, style: str | None = None, creator: str = 
             acc_grads: dict = {}
             for p, old_i in zip(chunk, olds):
                 for _inner in range(max(1, inner_steps)):
-                    g = {"X": p["X"], "A": p["A"], "chosen": p.get("chosen")}
+                    g = {"X": p["X"], "A": p["A"], "chosen": p.get("chosen"),
+                         "pref_eligible": p.get("pref_eligible", True)}
                     grads: dict = {}
                     m = grpo_loss_and_grads(model, [g], [old_i], temperature=temperature,
                                             clip_eps=clip_eps, entropy_coef=entropy_coef,

@@ -275,6 +275,283 @@ class TestObjectiveFidelity(unittest.TestCase):
                                    msg="one group per objective call")
 
 
+class TestPreferenceProvenance(unittest.TestCase):
+    """Only an EXTERNAL judgment may be logged as a revealed preference.
+
+    A pick the system itself made — the objective critic (`chosen_by=critic`) or the
+    identity's own selection (`chosen_by=taste`) — is not evidence about the creator.
+    It must still shape learning through the group-relative advantage over
+    critic-derived rewards, but it must not train the auxiliary preference term or
+    take the revealed-preference reward bonus. This is the local form of the
+    "guarded transmission" rule in group-relative preference learning (Crayotter,
+    arXiv:2608.02694): a group's own judgment must not be fed back as that group's
+    label. It is also why the loop has to record WHO picked, not just WHAT was picked.
+    """
+
+    #: Real feature names. `to_vector` silently ignores unknown keys, so a typo here
+    #: would produce all-zero vectors and a vacuously passing test — hence the
+    #: non-degeneracy assertion in `_dataset`.
+    _FEATURES = ("mean_shot_dur", "min_shot_dur", "log_n_segments")
+
+    def _dataset(self, path: str, judges: list[str]) -> None:
+        with open(path, "w", encoding="utf-8") as fh:
+            for i, who in enumerate(judges):
+                fh.write(json.dumps({
+                    "kind": "group", "group_id": f"g{i}", "clip_id": f"c{i}",
+                    "feature_spec": tm.FEATURE_SPEC_VIDEO, "chosen": 1, "chosen_by": who,
+                    "candidates": [
+                        {"features": {name: 1.0 + j * (k + 1)
+                                      for k, name in enumerate(self._FEATURES)},
+                         "reward_obj": 0.5 - 0.1 * j,
+                         "overall_obj": 0.5 - 0.1 * j, "dense_obj": 0.0}
+                        for j in range(3)],
+                }) + "\n")
+
+    def test_only_external_judgments_are_pref_eligible(self):
+        judges = ["creator", "agent", "human", "critic", "taste"]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "prov.jsonl")
+            self._dataset(path, judges)
+            prepared, stats = tm.build_training_arrays(path)
+        self.assertEqual(len(prepared), len(judges))
+        self.assertGreater(float(prepared[0]["X"].std()), 0.0,
+                           "fixture features are degenerate — renamed feature?")
+        for i, who in enumerate(judges):
+            self.assertEqual(
+                prepared[i]["pref_eligible"], who in tm.EXTERNAL_JUDGES,
+                f"chosen_by={who} must be pref_eligible={who in tm.EXTERNAL_JUDGES}")
+        self.assertEqual(stats["groups_pref_ineligible"], 2)
+        self.assertEqual(stats["picks_by_taste"], 1)
+        self.assertEqual(stats["picks_by_critic"], 1)
+
+    def test_reward_bonus_is_external_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "bonus.jsonl")
+            self._dataset(path, ["creator", "taste"])
+            prepared, _ = tm.build_training_arrays(path)
+        creator, taste = prepared[0], prepared[1]
+        # the creator's pick is pushed above the group's best score (0.5 + bonus 1.0)
+        self.assertAlmostEqual(float(creator["rewards"][1]), 1.5, places=6)
+        # the identity's own pick is left exactly as the critic scored it
+        self.assertAlmostEqual(float(taste["rewards"][1]), 0.4, places=6)
+
+    def test_system_pick_does_not_train_the_preference_term(self):
+        model = tm.StyleBrain(6, 6, 4, seed=0)
+        X = np.array([[1.0, 0, 0, 0, 0, 1], [0, 1.0, 0, 0, 0, 1], [0, 0, 1.0, 0, 0, 1]])
+        old = [tm.log_softmax(tm.policy_logits(model, X, 0.5)["s"])]
+        A = np.array([1.0, 0.0, -1.0])
+
+        def loss(pref_eligible, chosen):
+            return tm.grpo_loss_and_grads(
+                model, [{"X": X, "A": A, "chosen": chosen, "pref_eligible": pref_eligible}],
+                old, temperature=0.5, entropy_coef=0.0, pref_coef=0.5)["loss"]
+
+        external, system, no_pick = loss(True, 1), loss(False, 1), loss(False, None)
+        self.assertNotAlmostEqual(external, system, places=6,
+                                  msg="an external pick must move the objective")
+        self.assertAlmostEqual(system, no_pick, places=12,
+                               msg="a system pick must be indistinguishable from no pick at all")
+
+    def test_system_pick_still_learns_from_the_group_advantage(self):
+        """The guard narrows the preference term, not the learning: a group whose pick
+        the identity made still trains on the critic-derived rewards."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "onlysystem.jsonl")
+            self._dataset(path, ["taste", "taste"])
+            prepared, _ = tm.build_training_arrays(path)
+        self.assertTrue(all(not p["pref_eligible"] for p in prepared))
+        self.assertTrue(all(float(np.abs(p["A"]).max()) > 0.0 for p in prepared),
+                        "the group-relative advantage must survive the guard")
+
+
+class TestEffectFeatures(unittest.TestCase):
+    """The v1 layout is blind to multi-input effects; v2 is not.
+
+    Everything v1 measures describes the resulting CUT SEQUENCE, so a taste model
+    trained on it can choose *which selection* to use but cannot set a transition's
+    duration, a duck depth or a grade. v2 adds the effect-parameter features under a
+    NEW spec id — never an edit of v1 — because the layout list is part of an
+    artifact's digest, so a v1 identity keeps loading (and keeps refusing a v2 trunk)
+    instead of being silently reinterpreted with shifted columns.
+    """
+
+    @staticmethod
+    def _schema(**over) -> dict:
+        seg = {"trim": {"in": 0.0, "out": 2.0}, "retime": 0.0,
+               "timeline": {"in": 0.0, "out": 2.0},
+               "transition": {"type": "cut", "dur": 0.0, "params": {}},
+               "transform": {"scale": 1.0, "crop": None, "position": None},
+               "grade": {"lut": None, "eq": {}},
+               "audio": {"level": 1.0, "duck": 0.0, "fade": 0.0},
+               "overlay": []}
+        seg.update(over)
+        return {"structure": [dict(seg), dict(seg)]}
+
+    def test_v1_cannot_see_effects_and_v2_can(self):
+        schema = self._schema(
+            transition={"type": "dissolve", "dur": 1.2, "params": {"alignment": "start"}},
+            transform={"scale": 1.2, "crop": None, "position": None},
+            grade={"lut": "warm", "eq": {"saturation": 1.3}},
+            audio={"level": 0.5, "duck": 0.6, "fade": 0.0},
+            overlay=[{"kind": "text", "text": "hi"}])
+        v1 = tm.features_for(tm.FEATURE_SPEC_VIDEO, schema, {}, {})
+        v2 = tm.features_for(tm.FEATURE_SPEC_VIDEO_V2, schema, {}, {})
+        for name in tm.VIDEO_EFFECT_FEATURES:
+            self.assertNotIn(name, v1, f"the v1 layout must not silently gain {name}")
+            self.assertIn(name, v2)
+        self.assertGreater(v2["transition_dur_mean"], 0.0)
+        self.assertEqual(v2["transition_align_center_frac"], 0.0)
+        self.assertGreater(v2["grade_dev_mean"], 0.0)
+        self.assertEqual(v2["lut_frac"], 1.0)
+        self.assertEqual(v2["reframe_frac"], 1.0)
+        self.assertAlmostEqual(v2["duck_depth_mean"], 0.6, places=6)
+        self.assertLess(v2["gain_db_mean"], 0.0)
+        self.assertEqual(v2["overlay_frac"], 1.0)
+
+    def test_v2_is_a_superset_under_its_own_spec_id(self):
+        self.assertNotEqual(tm.FEATURE_SPEC_VIDEO, tm.FEATURE_SPEC_VIDEO_V2)
+        self.assertEqual(
+            tm.FEATURE_SPECS[tm.FEATURE_SPEC_VIDEO_V2],
+            tm.FEATURE_SPECS[tm.FEATURE_SPEC_VIDEO] + tm.VIDEO_EFFECT_FEATURES)
+
+    def test_mixed_spec_log_trains_on_the_majority_layout(self):
+        """v1 and v2 groups coexist in one log; mixing vector layouts would either
+        crash the first forward pass or silently mis-align columns."""
+        def group(i, spec):
+            return {"kind": "group", "group_id": f"g{i}", "clip_id": f"c{i}",
+                    "feature_spec": spec,
+                    "candidates": [{"features": {"mean_shot_dur": 0.2 * (j + 1)},
+                                    "reward_obj": 0.2 * j,
+                                    "overall_obj": 0.2 * j, "dense_obj": 0.0}
+                                   for j in range(3)]}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "mixed.jsonl")
+            with open(path, "w", encoding="utf-8") as fh:
+                for i in range(3):
+                    fh.write(json.dumps(group(i, tm.FEATURE_SPEC_VIDEO)) + "\n")
+                fh.write(json.dumps(group(9, tm.FEATURE_SPEC_VIDEO_V2)) + "\n")
+            prepared, stats = tm.build_training_arrays(path)
+        self.assertEqual(stats["train_spec"], tm.FEATURE_SPEC_VIDEO)
+        self.assertEqual(stats["groups_other_spec"], 1)
+        self.assertEqual(stats["specs_seen"], [tm.FEATURE_SPEC_VIDEO, tm.FEATURE_SPEC_VIDEO_V2])
+        self.assertTrue(all(p["spec"] == tm.FEATURE_SPEC_VIDEO for p in prepared))
+
+
+class TestEffectTaste(unittest.TestCase):
+    """Taste applied to a MULTI-INPUT EFFECT's parameters, not only to picks.
+
+    The data is synthetic; the mechanism is the real one. Groups are logged under
+    the effect-aware layout with a reward that rises with the transition duration —
+    a hidden preference expressed ONLY through an effect parameter — an identity is
+    trained on it, and the refiner must then choose a longer transition than the seed
+    carries. The control is the same call with no identity: no taste, no invention.
+    """
+
+    _DURS = (0.0, 0.2, 0.4, 0.8, 1.2)
+
+    @classmethod
+    def _schema(cls, dur: float) -> dict:
+        transition = ({"type": "dissolve", "dur": dur, "params": {"alignment": "center"}}
+                      if dur > 0 else {"type": "cut", "dur": 0.0, "params": {}})
+        seg = {"trim": {"in": 0.0, "out": 2.0}, "retime": 0.0,
+               "timeline": {"in": 0.0, "out": 2.0}, "transition": transition,
+               "transform": {"scale": 1.0, "crop": None, "position": None},
+               "grade": {"lut": None, "eq": {}},
+               "audio": {"level": 1.0, "duck": 0.0, "fade": 0.0}, "overlay": []}
+        return {"structure": [dict(seg) for _ in range(4)]}
+
+    def _log(self, path: str, clips: int = 6) -> None:
+        with open(path, "w", encoding="utf-8") as fh:
+            for clip in range(clips):
+                cands = []
+                for dur in self._DURS:
+                    schema = self._schema(dur)
+                    cands.append({
+                        "features": tm.features_for(tm.FEATURE_SPEC_VIDEO_V2, schema, {}, {}),
+                        "reward_obj": 10.0 * dur, "overall_obj": 10.0 * dur, "dense_obj": 0.0})
+                fh.write(json.dumps({"kind": "group", "group_id": f"g{clip}",
+                                     "clip_id": f"c{clip}",
+                                     "feature_spec": tm.FEATURE_SPEC_VIDEO_V2,
+                                     "candidates": cands}) + "\n")
+
+    def test_identity_chooses_effect_parameters(self):
+        import edit_apart_core as core
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "eff.jsonl")
+            self._log(log)
+            identity = os.path.join(d, "identity.gguf")
+            metrics = tm.train(log, identity, creator="c", epochs=120, seed=0)
+            self.assertGreaterEqual(metrics["history"][-1]["train_rank_acc"], 0.8,
+                                    "the identity did not fit a preference over an effect")
+            scorer = tm.TasteScorer.load(identity)
+        result = core.refine_effects(tm, self._schema(0.0), {}, {}, scorer, steps=6)
+        durations = [float(seg["transition"]["dur"]) for seg in result["schema"]["structure"]]
+        self.assertTrue(all(d > 0 for d in durations),
+                        f"the identity did not choose a transition at all: {durations}")
+        self.assertGreater(max(durations), 0.8,
+                           f"the identity did not push the duration up: {durations}")
+        self.assertTrue(result["trace"], "no axis change was recorded")
+        self.assertEqual(result["knobs"]["transition"], "dissolve")
+
+    def test_no_identity_means_no_effect_taste(self):
+        """The control: with no identity the refiner must change nothing. Maximising
+        the objective critic here would silently turn a rubric rule into a taste
+        claim — the same class of error as logging a system pick as a preference."""
+        import edit_apart_core as core
+        seed = self._schema(0.0)
+        result = core.refine_effects(tm, seed, {}, {}, None, steps=6)
+        self.assertIsNone(result["score"])
+        self.assertEqual(result["trace"], [])
+        self.assertEqual([seg["transition"]["type"] for seg in result["schema"]["structure"]],
+                         ["cut", "cut", "cut", "cut"])
+
+
+class TestEffectGrid(unittest.TestCase):
+    """A group the engine can actually learn an effect from.
+
+    The DEFAULT candidate grid varies shot selection only, so every candidate in a
+    group agrees on every effect feature — nothing in the loop could ever teach an
+    effect preference, and `refine` would have nothing to apply. `--effect-grid` pairs
+    the selection grid with effect knobs, so a revealed pick between two effect
+    settings becomes learnable. The default stays selection-only on purpose: changing
+    it would silently invalidate every measurement already recorded against it.
+    """
+
+    INVENTORY = {"source": "synthetic",
+                 "shots": [{"shot": f"clip_{i:03d}", "start": float(2 * i),
+                            "end": float(2 * i + 2), "duration": 2.0,
+                            "features": {"motion": 0.5, "lum": 0.5, "rms": -20.0}}
+                           for i in range(8)]}
+    RUBRIC = {"intent": "test", "pace": "medium", "min_shot_dur": 0.8,
+              "max_shot_dur": 4.0, "target_duration": 16.0, "no_shot_under_s": 0.9}
+
+    @staticmethod
+    def _candidates(path: str) -> list[dict]:
+        with open(path, encoding="utf-8") as fh:
+            return json.loads(fh.readline())["candidates"]
+
+    def test_effect_grid_spans_effect_parameters_and_logs_v2(self):
+        import edit_apart_core as core
+        with tempfile.TemporaryDirectory() as d:
+            plain, effect = os.path.join(d, "plain.jsonl"), os.path.join(d, "effect.jsonl")
+            out = core.cmd_propose(self.INVENTORY, self.RUBRIC, group=6,
+                                   dataset=plain, clip_id="c1")
+            self.assertEqual(out["group"]["feature_spec"], tm.FEATURE_SPEC_VIDEO)
+            out2 = core.cmd_propose(self.INVENTORY, self.RUBRIC, group=6,
+                                    dataset=effect, clip_id="c2", effect_grid=True)
+            self.assertEqual(out2["group"]["feature_spec"], tm.FEATURE_SPEC_VIDEO_V2)
+            plain_cands, effect_cands = self._candidates(plain), self._candidates(effect)
+        for name in ("transition_dur_mean", "duck_depth_mean", "grade_dev_mean"):
+            legacy = {round(c["features"].get(name, 0.0), 6) for c in plain_cands}
+            spanned = {round(c["features"].get(name, 0.0), 6) for c in effect_cands}
+            self.assertEqual(len(legacy), 1,
+                             f"the legacy grid must not vary {name} (it is the layout v1 cannot see)")
+            self.assertGreater(len(spanned), 1,
+                               f"the effect grid must span {name} or nothing is learnable")
+        self.assertTrue(any(c["knobs"].get("transition_dur") for c in effect_cands),
+                        "no candidate carries an effect knob")
+
+
 class TestGGUF(unittest.TestCase):
     def test_round_trip_bit_exact(self):
         with tempfile.TemporaryDirectory() as d:

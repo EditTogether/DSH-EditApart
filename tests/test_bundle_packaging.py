@@ -165,14 +165,22 @@ class TestBundlePackaging(unittest.TestCase):
     def test_no_machine_local_paths_anywhere(self):
         """Nothing a user receives may carry a path from a development machine."""
         offenders = []
-        # The file-URL scheme is ASSEMBLED, not written literally: this test file
-        # is itself shipped (and therefore scanned by the loop below), so a literal
-        # occurrence here would flag the checker instead of the payload. No
-        # exemption list, so a real machine-local path in this file is still caught.
-        file_url = "file:" + "/" * 3
+        # A `file://` URL is not by itself a machine-local path: OTIO media
+        # references legitimately use one — tools/otio_conformance.py points at a
+        # placeholder `file:///media/shot_001.mp4`, which names a mount, not a
+        # developer. What must never ship is a URL or absolute path naming a
+        # machine's own roots, so the patterns target those roots. The defect this
+        # guard was written for was a bridge module re-exporting a plugin through a
+        # local file URL pointing into a developer's home directory — still caught
+        # by two of the patterns below.
+        #
+        # The scheme is ASSEMBLED rather than written literally because this test
+        # file is itself shipped and scanned by the loop below; no exemption list
+        # is used, so a real machine path in this file is still caught.
+        file_url_root = "file:" + "/" * 3 + r"(?:home|Users|root|tmp|opt|var)/"
         patterns = (re.compile(r"/home/[A-Za-z0-9._-]+/", re.I),
                     re.compile(r"/Users/[A-Za-z0-9._-]+/"),
-                    re.compile(file_url, re.I),
+                    re.compile(file_url_root, re.I),
                     re.compile(r"[A-Za-z]:\\\\?(?:Users|Documents|dev)\\\\", re.I))
         for rel in _tracked_files():
             if rel.endswith((".png", ".jpg", ".mp4", ".gguf", ".pdf")):

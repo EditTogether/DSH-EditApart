@@ -9,10 +9,11 @@
 //                     -> bin/edit_apart_core.py -> bin/taste_model.py
 //   * 1 guarded model-routing hook (video-in/out general model) -> opt-in via env.
 //
-// Mounted by the `ai-video-editor` (EditApart) preset via a RELATIVE path
-// (`name: ./plugins/edit-apart.mjs`), so it is import-free on purpose: a
-// user-preset relative-mounted module resolves its internal imports against the
-// preset dir and cannot `import { defineTool } from '@deepseek-ai/dsh-tools'`.
+// Mounted by the `ai-video-editor` (EditApart) preset as a PACKAGE SUBPATH
+// (`name: dsh-edit-apart/plugins/edit-apart.mjs`), so it is import-free on
+// purpose: a preset row's specifier resolves against the PROFILE directory,
+// where the harness's own `@deepseek-ai/*` packages are not resolvable, so it
+// cannot `import { defineTool } from '@deepseek-ai/dsh-tools'`.
 // It hand-builds plain ToolDefinitions and registers them with
 // `ctx.tools.register()`, passing JSON-Schema directly (no defineTool
 // normalization). The actual work is done by the import-free engines, invoked
@@ -163,6 +164,9 @@ export function apply(ctx) {
           group: { type: 'number', description: `Candidate schemas to consider (1 = legacy single schema). Default ${GROUP_DEFAULT}.` },
           identity: { type: 'string', description: 'Per-creator taste GGUF to select with. Default: the workspace identity if it exists.' },
           select: { type: 'string', enum: ['auto', 'taste', 'objective'], description: 'auto (taste if an identity exists), taste, or objective.' },
+          effect_grid: { type: 'boolean', description: 'Span the multi-input effect parameters across the group (transitions, ducking, grade) so a revealed pick can teach an effect preference; logs under video/v2 by default. Off = the legacy selection-only grid.' },
+          refine: { type: 'number', description: 'Coordinate-ascent passes that let the IDENTITY choose the multi-input effect parameters (transition type/duration/alignment, duck, grade) instead of only ranking fixed candidates; the tuned schema joins the group. Needs an identity trained on video/v2 (effect-aware). 0 = off.' },
+          feature_spec: { type: 'string', enum: ['video/v1', 'video/v2'], description: 'Layout to LOG this group under. video/v2 adds the effect-parameter features; without them an identity can never learn an effect preference. Default: the identity\'s own layout, else video/v1.' },
           no_log: { type: 'boolean', description: 'Do not append this group to the training log.' },
         },
         required: ['inventory', 'rubric'],
@@ -175,6 +179,9 @@ export function apply(ctx) {
         if (identity && existsSync(identity)) argv.push('--identity', identity)
         if (STYLE) argv.push('--style', STYLE)
         if (args.select) argv.push('--select', String(args.select))
+        if (args.effect_grid) argv.push('--effect-grid')
+        if (args.refine) argv.push('--refine', String(args.refine))
+        if (args.feature_spec) argv.push('--feature-spec', String(args.feature_spec))
         if (args.no_log) argv.push('--no-log')
         return runCore(VIDEO_CORE, argv)
       },
@@ -223,7 +230,7 @@ export function apply(ctx) {
           subjective: { type: 'number', description: '0..1 vision-model judgment to fold in (optional).' },
           group_id: { type: 'string', description: 'Group id from propose_schema: logs this outcome as the group\'s reward.' },
           candidate: { type: 'number', description: 'Which candidate of the group this critique is for (default 0).' },
-          chosen_by: { type: 'string', enum: ['critic', 'creator', 'agent'], description: 'Who picked this candidate. A creator/agent pick is logged as a REVEALED preference and becomes the group\'s top reward.' },
+          chosen_by: { type: 'string', enum: ['critic', 'creator', 'agent', 'human', 'taste'], description: 'Who picked this candidate. creator/agent/human is an EXTERNAL judgment, logged as a REVEALED preference (top reward + preference term). taste means the per-creator identity selected it and no external judge overrode — the system\'s own choice, which trains NEITHER, because a judgment the system made is not evidence about the creator. critic means only the objective critic scored the group.' },
         },
         required: ['schema', 'inventory', 'rubric'],
       },
@@ -350,6 +357,9 @@ export function apply(ctx) {
         if (identity && existsSync(identity)) argv.push('--identity', identity)
         if (process.env.DSH_EDITAPART_STYLE) argv.push('--style', process.env.DSH_EDITAPART_STYLE)
         if (args.select) argv.push('--select', String(args.select))
+        if (args.effect_grid) argv.push('--effect-grid')
+        if (args.refine) argv.push('--refine', String(args.refine))
+        if (args.feature_spec) argv.push('--feature-spec', String(args.feature_spec))
         if (args.no_log) argv.push('--no-log')
         return runCore(PHOTO_CORE, argv)
       },
@@ -381,7 +391,7 @@ export function apply(ctx) {
           subjective: { type: 'number', description: '0..1 vision-model judgment to fold in (optional).' },
           group_id: { type: 'string', description: 'Group id from photo_propose: logs this outcome as the group\'s reward.' },
           candidate: { type: 'number', description: 'Which candidate of the group this critique is for (default 0).' },
-          chosen_by: { type: 'string', enum: ['critic', 'creator', 'agent'], description: 'Who picked this candidate. A creator/agent pick is logged as a REVEALED preference and becomes the group\'s top reward.' },
+          chosen_by: { type: 'string', enum: ['critic', 'creator', 'agent', 'human', 'taste'], description: 'Who picked this candidate. creator/agent/human is an EXTERNAL judgment, logged as a REVEALED preference (top reward + preference term). taste means the per-creator identity selected it and no external judge overrode — the system\'s own choice, which trains NEITHER, because a judgment the system made is not evidence about the creator. critic means only the objective critic scored the group.' },
         },
         required: ['schema', 'rubric', 'result'],
       },
@@ -433,7 +443,7 @@ export function apply(ctx) {
   ctx.systemPrompt.section({
     name: 'tool:edit-apart',
     order: 106,
-    text: 'You are a taste-driven video + photo editor (EditApart). Prefer the edit-apart tools (inventory, features, propose_schema, render_schema, review_frames, critic_edit, revise_schema, train_identity, taste_status, identity_init, and photo_inspect/photo_propose/photo_render/photo_critic/photo_revise) over ad-hoc commands for any edit task. propose_schema returns a GROUP of candidate edits and selects one; when you render a DIFFERENT candidate than the selected one, or a human picks one, log it with critic_edit chosen_by=creator|agent — that revealed pick is what teaches the per-creator taste identity. Run train_identity when the log has enough clips (taste_status shows the count), then later proposals are selected by that learned identity. Always review_frames before dropping a shot — the vision leg is normative; motion-luma is only a hint. For photos, read the result image with your eyes before dropping an operation.',
+    text: 'You are a taste-driven video + photo editor (EditApart). Prefer the edit-apart tools (inventory, features, propose_schema, render_schema, review_frames, critic_edit, revise_schema, train_identity, taste_status, identity_init, and photo_inspect/photo_propose/photo_render/photo_critic/photo_revise) over ad-hoc commands for any edit task. propose_schema returns a GROUP of candidate edits and selects one; when you render a DIFFERENT candidate than the selected one, or a human picks one, log it with critic_edit chosen_by=creator|agent — that revealed pick is what teaches the per-creator taste identity. If instead the identity itself selected what got rendered, log chosen_by=taste: a system-made choice is not a revealed preference and must not be reported as one (only external judgments train the taste model). Run train_identity when the log has enough clips (taste_status shows the count), then later proposals are selected by that learned identity. To let the identity choose MULTI-INPUT EFFECT parameters (transition type/duration/alignment, duck, grade) rather than only rank fixed candidates, log groups with feature_spec=video/v2 and then propose with refine>0 — it is declined with a reason if the identity was trained on a layout without effect features. Always review_frames before dropping a shot — the vision leg is normative; motion-luma is only a hint. For photos, read the result image with your eyes before dropping an operation.',
   })
 
   return disposeAll

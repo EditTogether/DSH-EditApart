@@ -33,6 +33,7 @@ only difference).
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -327,6 +328,149 @@ def _propose_variant(inventory: dict, rubric: dict, target_factor: float,
                         "pace": rubric.get("pace")}}
 
 
+# ── effect parameters (the "MIMO" effects) ──────────────────────────────────
+# A transition joins TWO clips, ducking relates speech to music, an overlay
+# composites layers. The selection grid above varies none of them, so a taste
+# model over the v1 layout can only choose WHICH selection to use — it cannot set
+# how the inputs combine. These are the axes such an effect actually has, and
+# `_refine_effects` searches them with the identity's score.
+TRANSITION_TYPES = ("cut", "dissolve")
+TRANSITION_ALIGNMENTS = ("center", "start", "end")
+TRANSITION_DURS = (0.0, 0.2, 0.4, 0.8, 1.2)
+DUCK_DEPTHS = (0.0, 0.3, 0.6)
+GRADE_STRENGTHS = (0.0, 1.0, 2.0)
+
+EFFECT_DEFAULTS = {"transition": "cut", "transition_dur": 0.0,
+                   "transition_align": "center", "duck": 0.0, "grade": 0.0}
+
+#: Candidate grid for effect-spanning groups (`--effect-grid`). The default grid
+#: varies shot SELECTION only, so its candidates are identical in every effect
+#: feature — an identity trained on those groups can never learn an effect
+#: preference, and `refine` would have nothing to apply. These entries are paired
+#: with the selection grid so one group spans both, which is what lets an external
+#: pick between two effect settings become a revealed preference.
+EFFECT_CANDIDATE_GRID = (
+    {},                                                                    # rubric verbatim
+    {"transition": "dissolve", "transition_dur": 0.4, "transition_align": "center"},
+    {"transition": "dissolve", "transition_dur": 0.8, "transition_align": "center"},
+    {"transition": "dissolve", "transition_dur": 0.8, "transition_align": "start"},
+    {"duck": 0.3},
+    {"duck": 0.6, "grade": 1.0},
+)
+
+#: The axes swept by the refiner, in a FIXED order so a run is reproducible.
+#: Each option is a knob OVERRIDE SET rather than a single value, because the
+#: parameters are coupled: a transition needs a type AND a positive duration, so
+#: sweeping "type" and "duration" separately gets stuck the moment the type changes
+#: while the duration is still 0 (the renderer then has no transition to score).
+EFFECT_AXES = (
+    ("transition", tuple({"transition": t, "transition_dur": d}
+                         for t, d in (("cut", 0.0), ("dissolve", 0.2), ("dissolve", 0.4),
+                                      ("dissolve", 0.8), ("dissolve", 1.2)))),
+    ("transition_align", tuple({"transition_align": a} for a in TRANSITION_ALIGNMENTS)),
+    ("duck", tuple({"duck": d} for d in DUCK_DEPTHS)),
+    ("grade", tuple({"grade": g} for g in GRADE_STRENGTHS)),
+)
+
+
+def apply_effects(schema: dict, knobs: dict) -> dict:
+    """Write multi-input effect parameters onto every segment of a schema.
+
+    `cut` clears the duration and the alignment; any other type carries both,
+    because the renderer's implicit choice (each side takes half the duration) is
+    a DECISION that used to be made silently and never recorded. Grade strength
+    scales saturation/contrast from the rubric's own baseline, so grading never
+    contradicts the rubric's intent — it interpolates around it.
+    """
+    type_ = str(knobs.get("transition", "cut"))
+    dur = float(knobs.get("transition_dur", 0.0) or 0.0)
+    align = str(knobs.get("transition_align", "center"))
+    duck = float(knobs.get("duck", 0.0) or 0.0)
+    grade = float(knobs.get("grade", 0.0) or 0.0)
+    for seg in schema.get("structure") or []:
+        if type_ == "cut" or dur <= 0.0:
+            seg["transition"] = {"type": "cut", "dur": 0.0, "params": {}}
+        else:
+            seg["transition"] = {"type": type_, "dur": round(dur, 3),
+                                 "params": {"alignment": align}}
+        if duck:
+            seg.setdefault("audio", {})["duck"] = round(duck, 4)
+        if grade:
+            eq = seg.setdefault("grade", {}).setdefault("eq", {})
+            eq["saturation"] = round(1.0 + 0.10 * grade, 4)
+            eq["contrast"] = round(0.05 * grade, 4)
+    return schema
+
+
+def knobs_from_schema(schema: dict) -> dict:
+    """Recover the effect knobs a schema already carries (so a refinement starts
+    from the candidate under test rather than from a hardcoded default)."""
+    knobs = dict(EFFECT_DEFAULTS)
+    for seg in schema.get("structure") or []:
+        tr = seg.get("transition") or {}
+        if tr.get("type") not in (None, "", "cut") and float(tr.get("dur") or 0.0) > 0:
+            knobs["transition"] = str(tr["type"])
+            knobs["transition_dur"] = float(tr["dur"])
+            knobs["transition_align"] = str((tr.get("params") or {}).get("alignment", "center"))
+        audio = seg.get("audio") or {}
+        if float(audio.get("duck") or 0.0) > 0:
+            knobs["duck"] = float(audio["duck"])
+        eq = (seg.get("grade") or {}).get("eq") or {}
+        sat = float(eq.get("saturation", 1.0) or 1.0)
+        if abs(sat - 1.0) > 1e-9:
+            knobs["grade"] = round((sat - 1.0) / 0.10, 3)
+        break
+    return knobs
+
+
+def _effect_score(tm, spec: str, schema: dict, inventory: dict, rubric: dict,
+                  scorer) -> float:
+    if scorer is None:
+        return 0.0
+    return float(scorer.score_features(tm.features_for(spec, schema, inventory, rubric)))
+
+
+def refine_effects(tm, schema: dict, inventory: dict, rubric: dict, scorer,
+                   steps: int = 3, spec: str | None = None) -> dict:
+    """Coordinate ascent over the effect parameters, scored by the identity.
+
+    This is what "apply the taste to a multi-input effect" MEANS operationally: the
+    identity does not only rank a fixed list of whole candidates, it chooses the
+    parameter values. Deterministic — the axes are swept in a fixed order, a tie
+    keeps the incumbent, and `steps` bounds the passes — so two runs with the same
+    identity and the same starting schema agree exactly.
+
+    A `scorer` of None returns the schema untouched: with no identity there is no
+    taste to apply, and inventing one (e.g. maximising the objective critic here)
+    would silently turn a rubric rule into a taste claim.
+    """
+    spec = spec or tm.FEATURE_SPEC_VIDEO_V2
+    trace: list[dict] = []
+    if scorer is None:
+        return {"schema": schema, "knobs": knobs_from_schema(schema),
+                "trace": trace, "score": None}
+    best = copy.deepcopy(schema)
+    knobs = knobs_from_schema(best)
+    best_score = _effect_score(tm, spec, best, inventory, rubric, scorer)
+    for _ in range(max(0, int(steps))):
+        improved = False
+        for axis, options in EFFECT_AXES:
+            for option in options:
+                if all(knobs.get(k) == v for k, v in option.items()):
+                    continue                      # already there: nothing to try
+                trial_knobs = {**knobs, **option}
+                trial = apply_effects(copy.deepcopy(best), trial_knobs)
+                score = _effect_score(tm, spec, trial, inventory, rubric, scorer)
+                if score > best_score + 1e-12:
+                    best, best_score, knobs = trial, score, trial_knobs
+                    trace.append({"axis": axis, "option": dict(option),
+                                  "score": round(score, 6)})
+                    improved = True
+        if not improved:
+            break
+    return {"schema": best, "knobs": knobs, "trace": trace, "score": round(best_score, 6)}
+
+
 def _grid_for(group: int) -> list:
     """The deterministic candidate grid, capped at the table size."""
     n = max(1, min(int(group), len(CANDIDATE_GRID)))
@@ -336,13 +480,21 @@ def _grid_for(group: int) -> list:
 def cmd_propose(inventory: dict, rubric: dict, group: int = 1, identity: str | None = None,
                 style: str | None = None, dataset: str | None = None,
                 clip_id: str | None = None, select: str = "auto",
-                log: bool = True) -> dict:
+                log: bool = True, refine: int = 0,
+                feature_spec: str | None = None, effect_grid: bool = False) -> dict:
     """Propose a group of candidate schemas, select one, and log the group.
 
     Selection: with an identity, `select=auto|taste` picks the taste-model
     argmax; otherwise (or with `select=objective`) it picks the best objective
     reward. Either way `group=1` selects the only candidate, which is the legacy
     schema.
+
+    `refine=N` additionally lets the identity choose the MULTI-INPUT EFFECT
+    parameters (transition type/duration/alignment, ducking, grade strength) by
+    coordinate ascent, and appends the tuned schema to the group as one more
+    candidate. It requires an identity whose trunk was trained on the effect-aware
+    layout (`video/v2`): a v1 trunk has 16 inputs and cannot score a 26-dim vector,
+    so the request is declined with a reason rather than silently ignored.
     """
     tm = _taste()
     grid = _grid_for(group)
@@ -351,11 +503,16 @@ def cmd_propose(inventory: dict, rubric: dict, group: int = 1, identity: str | N
     for i, (target_factor, min_factor, skip_short, keep_max) in enumerate(grid):
         schema = _propose_variant(inventory, rubric, target_factor, min_factor,
                                   skip_short, keep_max)
+        effect_knobs = {}
+        if effect_grid:
+            effect_knobs = dict(EFFECT_CANDIDATE_GRID[i % len(EFFECT_CANDIDATE_GRID)])
+            if effect_knobs:
+                apply_effects(schema, effect_knobs)
         crit = _score_objective(schema, inventory, rubric, None)
         cands.append({
             "idx": i, "schema": schema, "critic": crit,
             "knobs": {"target_factor": target_factor, "min_shot_factor": min_factor,
-                      "skip_short": skip_short, "keep_max": keep_max},
+                      "skip_short": skip_short, "keep_max": keep_max, **effect_knobs},
         })
 
     scorer = None
@@ -364,9 +521,37 @@ def cmd_propose(inventory: dict, rubric: dict, group: int = 1, identity: str | N
         scorer = tm.TasteScorer.load(identity, style)
         spec = scorer.feature_spec
     if spec is None:
-        spec = tm.FEATURE_SPEC_VIDEO
+        # An effect-spanning group is only meaningful under a layout that can SEE
+        # the effects, so it selects the effect-aware one unless told otherwise.
+        spec = feature_spec or (tm.FEATURE_SPEC_VIDEO_V2 if effect_grid
+                                else tm.FEATURE_SPEC_VIDEO)
     feats = [tm.features_for(spec, c["schema"], inventory, rubric) for c in cands]
     scores = scorer.score_many(feats) if scorer else [None] * len(cands)
+
+    # ── taste applied to the multi-input effects ─────────────────────────────
+    refined: dict | None = None
+    refine_note: str | None = None
+    if refine > 0:
+        if scorer is None:
+            refine_note = "no identity: there is no taste to apply to the effects"
+        elif spec != tm.FEATURE_SPEC_VIDEO_V2:
+            refine_note = (f"identity trunk is trained on {spec}, which has no effect "
+                           "features; retrain on the effect-aware layout to tune effects")
+        else:
+            seed = max(range(len(cands)), key=lambda i: scores[i])
+            refined = refine_effects(tm, cands[seed]["schema"], inventory, rubric,
+                                     scorer, steps=refine, spec=spec)
+            if refined["score"] is not None and refined["score"] > scores[seed] + 1e-12:
+                feats.append(tm.features_for(spec, refined["schema"], inventory, rubric))
+                scores.append(refined["score"])
+                cands.append({
+                    "idx": len(cands), "schema": refined["schema"],
+                    "critic": _score_objective(refined["schema"], inventory, rubric, None),
+                    "knobs": {**cands[seed]["knobs"], "effects": refined["knobs"],
+                              "refined_from": seed},
+                })
+            else:
+                refine_note = "the identity scored no effect change above the seed candidate"
 
     if select == "taste" and scorer is None:
         raise RuntimeError("select=taste requires an identity (--identity / DSH_EDITAPART_IDENTITY)")
@@ -400,6 +585,8 @@ def cmd_propose(inventory: dict, rubric: dict, group: int = 1, identity: str | N
     out["group"] = {
         "group_id": gid, "feature_spec": spec, "size": len(cands),
         "selected": selected, "select_by": select_by, "dataset": dataset,
+        "refine": refine, "refine_note": refine_note,
+        "effects": (refined["knobs"] if refined else None),
         "clip_id": clip,
         "taste": ({"identity": identity, "scores": [round(s, 6) for s in scores]}
                   if scorer else None),
@@ -873,6 +1060,18 @@ def main() -> int:
     p.add_argument("--dataset", default=os.getenv("DSH_EDITAPART_DATASET"))
     p.add_argument("--clip-id", default=None)
     p.add_argument("--select", choices=["auto", "taste", "objective"], default="auto")
+    p.add_argument("--refine", type=int, default=0, metavar="N",
+                   help="let the identity choose the MULTI-INPUT EFFECT parameters "
+                        "(transition type/duration/alignment, duck, grade) by coordinate "
+                        "ascent; needs an identity whose trunk was trained on video/v2")
+    p.add_argument("--feature-spec", choices=["video/v1", "video/v2"], default=None,
+                   help="layout to LOG this group under (default: the identity's own, "
+                        "else video/v1). video/v2 adds the effect-parameter features a "
+                        "MIMO-effect taste model needs.")
+    p.add_argument("--effect-grid", action="store_true",
+                   help="span the MULTI-INPUT EFFECT parameters across the group "
+                        "(transitions, ducking, grade) so a revealed pick can teach an "
+                        "effect preference; logs under video/v2 by default")
     p.add_argument("--no-log", action="store_true", help="do not append the group to the dataset")
 
     p = sub.add_parser("render")
@@ -889,9 +1088,14 @@ def main() -> int:
     p.add_argument("--dataset", default=os.getenv("DSH_EDITAPART_DATASET"))
     p.add_argument("--group-id", default=None)
     p.add_argument("--candidate", type=int, default=0)
-    p.add_argument("--chosen-by", choices=["critic", "creator", "agent", "human"],
+    p.add_argument("--chosen-by", choices=["critic", "creator", "agent", "human", "taste"],
                    default="critic",
-                   help="who picked this candidate: a creator/agent pick is logged "
+                   help="who picked this candidate. `creator`/`agent`/`human` is an "
+                        "EXTERNAL judgment and is logged as a REVEALED preference; `taste` "
+                        "means the per-creator identity selected it and no external judge "
+                        "overrode — that is the system's own choice and teaches nothing "
+                        "about the creator; `critic` means only the objective critic "
+                        "scored the group. A creator/agent pick is logged "
                         "as a revealed preference")
 
     p = sub.add_parser("revise")
@@ -960,7 +1164,9 @@ def main() -> int:
             result = cmd_propose(json.loads(args.inventory), json.loads(args.rubric),
                                  group=args.group, identity=args.identity, style=args.style,
                                  dataset=args.dataset, clip_id=args.clip_id,
-                                 select=args.select, log=not args.no_log)
+                                 select=args.select, log=not args.no_log,
+                                 refine=args.refine, feature_spec=args.feature_spec,
+                                 effect_grid=args.effect_grid)
         elif args.cmd == "render":
             result = cmd_render(args.src, json.loads(args.schema), args.out)
         elif args.cmd == "review_frames":

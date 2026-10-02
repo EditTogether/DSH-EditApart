@@ -269,6 +269,53 @@ to the effect that changed (the segment-local-credit design in
 rather than continuous optimisation; and effects carry no provenance of their own beyond
 the pick provenance described above.
 
+### The training datum (and why the raws are kept)
+
+A taste datum is not a timeline with a score; it is a **group**: alternatives produced
+under one fixed request, materials and constraint set. Schema **v3** of the group
+record keeps everything a replay needs, in the record itself:
+
+| Kept | Why |
+| --- | --- |
+| `rubric` + `rubric_hash` | the constraints are what make the candidates comparable |
+| `inventory` + `inventory_hash` | the evidence the features were computed from (per-shot motion/luma/rms) |
+| each candidate's `schema` — the timeline, not just its knobs | so a feature can be re-derived, a reward re-scored, and credit attributed to the effect that changed |
+| `source_sha256` | the raws are identified by **content**, not by path |
+| `content_hash` | deterministic identity of the proposal, so a ledger can key annotations to a revision |
+| `selected`, `engine`, `feature_spec` | what was chosen, by which build, under which layout |
+
+Before v3 a record kept only derived numbers — no rubric, no inventory, no timeline, no
+source identity — so a defect in the feature extractor or a change to the critic made
+the corpus un-remeasurable. This project's own corrections log is a history of needing
+exactly that: three conclusions flipped after defects and each had to be re-measured
+**on the same data**. Keeping the raws is the precondition for that discipline, and an
+NLE makes it sharper, because there the edit is a reference structure over a media pool
+rather than a schema over one file.
+
+```bash
+# re-derive every logged group from its own record and compare
+python bin/edit_apart_core.py replay <dataset.jsonl> [--limit N]
+```
+
+It recomputes each candidate's feature vector and the objective reward from the
+recorded timeline + inventory + rubric, verifies the hashes, and reports older records
+as **not replayable** rather than guessing. The subjective leg is a person's or agent's
+judgment: it is reported as not recomputable and never re-invented.
+`tests/test_taste_model.py::TestLogReplay` is the acceptance test, with two negative
+controls — a corrupted stored vector and a **changed source file** are both caught.
+
+**Why annotations stay on our side.** Measured: through the FCPXML adapter nothing of
+ours is even written — not the effect, not the marker, not the metadata
+(`tools/otio_conformance.py` documents the lossless container). So the ledger carries
+the judgment (`why`, decisions, provenance) keyed by `content_hash`, the timeline
+carries structure, and export is one-way and lossy: anything crossing an editor
+boundary returns as a *new revision* with a *new* judgment, never as recovered
+metadata.
+
+**Not yet v3:** the photo engine still writes pre-v3 records (a replay reports them as
+not replayable), and media retention is a policy here rather than an enforced
+garbage-collection rule.
+
 ### Measured results
 
 | Claim | Measurement |
@@ -284,7 +331,7 @@ the pick provenance described above.
 | The repair is partial and content-driven | 4-arm transfer experiment (re-measured): only the 3-image/narrow-family arm transferred to an unseen image+geometry (tight/loose ratio **0.400**) while A1/A2/B2 showed no effect (1.000); on a *seen* image at the same geometry three of four arms did separate. The ±0.36 ordering-metric noise floor from the no-taste control is a pre-fix measurement |
 | The loop is numpy-optional | legacy `propose group=1` and group logging work with numpy blocked; only the model path errors |
 
-Reproduce with `tests/test_taste_model.py` (52 tests, no media needed) and
+Reproduce with `tests/test_taste_model.py` (58 tests, no media needed) and
 `tests/test_loop_e2e.py` (real footage; see **Verification**).
 
 ### Concurrent work (2026-09)
@@ -595,7 +642,7 @@ empty `style_file` no longer resolves to a directory.
 # the no-machine-local-paths rule (needs PyYAML; <1s)
 ~/dsh-edit-venv/bin/python tests/test_bundle_packaging.py -v
 
-# model + video loop unit suite: 52 tests, no media required (~25s)
+# model + video loop unit suite: 58 tests, no media required (~25s)
 ~/dsh-edit-venv/bin/python tests/test_taste_model.py -v
 
 # environment conformance: prove THIS install's renderer/prober can support the

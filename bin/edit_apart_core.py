@@ -328,6 +328,46 @@ def _propose_variant(inventory: dict, rubric: dict, target_factor: float,
                         "pace": rubric.get("pace")}}
 
 
+#: Dataset record version. v3 carries what a REPLAY needs — the constraints, the
+#: evidence, the timelines and the source identity — not only the derived numbers.
+#: Without them a logged group cannot be re-derived, so a defect in the feature
+#: extractor or a change to the critic would make the whole corpus un-remeasurable
+#: and force a re-shoot. Records stay readable across versions: the trainer reads
+#: the fields it knows and ignores the rest, and `replay` reports older records as
+#: not replayable rather than guessing.
+DATASET_SCHEMA_VERSION = 3
+ENGINE_VERSION = "edit_apart_core/0.2.1"     # bump when the extractor changes
+
+
+def _canonical_hash(obj) -> str:
+    """Deterministic content hash of a JSON-able object.
+
+    `sort_keys` + fixed separators so the hash depends on the CONTENT, not on dict
+    ordering or whitespace: two runs that produce the same group produce the same
+    hash, which is what lets a ledger key annotations to a revision.
+    """
+    blob = json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _sha256_file(path: str | None) -> str | None:
+    """Streaming content hash of a source file, or None when it is unavailable.
+
+    None is recorded as *no hash*, never as a wrong one: a replay must be able to
+    tell "the source is not identified" from "the source changed".
+    """
+    if not path or not os.path.isfile(path):
+        return None
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for block in iter(lambda: fh.read(1 << 20), b""):
+                h.update(block)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
 # ── effect parameters (the "MIMO" effects) ──────────────────────────────────
 # A transition joins TWO clips, ducking relates speech to music, an overlay
 # composites layers. The selection grid above varies none of them, so a taste
@@ -471,6 +511,108 @@ def refine_effects(tm, schema: dict, inventory: dict, rubric: dict, scorer,
     return {"schema": best, "knobs": knobs, "trace": trace, "score": round(best_score, 6)}
 
 
+def cmd_replay(dataset: str, limit: int | None = None) -> dict:
+    """Re-derive every logged group and check it against what the record stored.
+
+    This is what turns "we keep what a replay needs" from a policy into a property.
+    For each v3 group the record itself supplies the timeline, the inventory, the
+    rubric and the feature layout, and this recomputes:
+
+      * each candidate's feature vector — compared with the vector written at log time;
+      * the objective reward (and its components) from the same three inputs;
+      * the recorded content / rubric / inventory hashes, plus the source media hash
+        when one was recorded and the file is still on disk.
+
+    The SUBJECTIVE leg is a person's or agent's judgment, so it is reported as not
+    recomputable and never re-invented. Older records (no timeline/evidence, or
+    `dataset_schema_version` < 3) are counted as NOT replayable — an explicit state,
+    not a silent skip and not a failure.
+    """
+    tm = _taste()
+    report = {"dataset": dataset, "groups": 0, "replayable": 0, "not_replayable": 0,
+              "clean": 0, "candidates_checked": 0, "features_match": 0,
+              "rewards_match": 0, "source_hash_checked": 0, "source_hash_unavailable": 0,
+              "unparsable_lines": 0, "mismatches": []}
+    if not os.path.isfile(dataset):
+        raise FileNotFoundError(f"dataset not found: {dataset}")
+    with open(dataset, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                report["unparsable_lines"] += 1
+                continue
+            if rec.get("kind") != "group":
+                continue
+            if limit is not None and report["groups"] >= int(limit):
+                break
+            report["groups"] += 1
+            spec = rec.get("feature_spec")
+            rubric, inventory = rec.get("rubric"), rec.get("inventory")
+            cands = rec.get("candidates") or []
+            structural = (int(rec.get("dataset_schema_version") or 0) >= DATASET_SCHEMA_VERSION
+                          and isinstance(rubric, dict) and isinstance(inventory, dict)
+                          and bool(cands)
+                          and all(isinstance(c.get("schema"), dict) for c in cands)
+                          and spec in tm.FEATURE_SPECS)
+            if not structural:
+                report["not_replayable"] += 1
+                continue
+            report["replayable"] += 1
+            problems: list[str] = []
+            if rec.get("rubric_hash") != _canonical_hash(rubric):
+                problems.append("rubric_hash")
+            if rec.get("inventory_hash") != _canonical_hash(inventory):
+                problems.append("inventory_hash")
+            if rec.get("content_hash") != _canonical_hash({
+                    "feature_spec": spec, "rubric": rubric, "inventory": inventory,
+                    "candidates": [c["schema"] for c in cands]}):
+                problems.append("content_hash")
+            recorded_sha = rec.get("source_sha256")
+            if recorded_sha:
+                actual_sha = _sha256_file(inventory.get("source"))
+                if actual_sha is None:
+                    report["source_hash_unavailable"] += 1
+                elif actual_sha != recorded_sha:
+                    problems.append("source_sha256")
+                else:
+                    report["source_hash_checked"] += 1
+            for c in cands:
+                report["candidates_checked"] += 1
+                idx = c.get("idx")
+                derived = tm.features_for(spec, c["schema"], inventory, rubric)
+                stored = c.get("features") or {}
+                drift = {k: [stored.get(k), derived.get(k)] for k in set(stored) | set(derived)
+                         if abs(float(stored.get(k, 0.0) or 0.0)
+                                - float(derived.get(k, 0.0) or 0.0)) > 1e-9}
+                if drift:
+                    problems.append(f"features[{idx}]")
+                else:
+                    report["features_match"] += 1
+                crit = _score_objective(c["schema"], inventory, rubric, None)
+                reward_ok = (abs(float(crit["reward"]) - float(c.get("reward_obj") or 0.0)) <= 1e-9
+                             and abs(float(crit["overall_score"])
+                                     - float(c.get("overall_obj") or 0.0)) <= 1e-9
+                             and abs(sum(e["reward_delta"] for e in crit["elements"])
+                                     - float(c.get("dense_obj") or 0.0)) <= 1e-4)
+                if reward_ok:
+                    report["rewards_match"] += 1
+                else:
+                    problems.append(f"reward[{idx}]")
+            if problems:
+                report["mismatches"].append({"group_id": rec.get("group_id"),
+                                             "content_hash": rec.get("content_hash"),
+                                             "problems": sorted(set(problems))})
+            else:
+                report["clean"] += 1
+    report["ok"] = bool(report["replayable"] and not report["mismatches"]
+                        and not report["not_replayable"])
+    return report
+
+
 def _grid_for(group: int) -> list:
     """The deterministic candidate grid, capped at the table size."""
     n = max(1, min(int(group), len(CANDIDATE_GRID)))
@@ -566,16 +708,31 @@ def cmd_propose(inventory: dict, rubric: dict, group: int = 1, identity: str | N
         f"{clip}|{spec}|{[c['knobs'] for c in cands]}|{time.time_ns()}".encode()
     ).hexdigest()[:12]
     if dataset and log:
+        # Everything a replay needs, in the record itself: the constraint set that
+        # made these alternatives comparable, the evidence the features came from,
+        # the timelines (not just knobs and vectors), and the source identity.
+        rubric_hash = _canonical_hash(rubric)
+        inventory_hash = _canonical_hash(inventory)
+        source_sha256 = _sha256_file(inventory.get("source"))
+        content_hash = _canonical_hash({
+            "feature_spec": spec, "rubric": rubric, "inventory": inventory,
+            "candidates": [c["schema"] for c in cands],
+        })
         _log_jsonl(dataset, {
             "kind": "group", "group_id": gid, "clip_id": clip,
+            "dataset_schema_version": DATASET_SCHEMA_VERSION, "engine": ENGINE_VERSION,
             "feature_spec": spec, "created": int(time.time()),
-            "select_by": select_by,
+            "select_by": select_by, "selected": selected,
+            "content_hash": content_hash, "rubric_hash": rubric_hash,
+            "inventory_hash": inventory_hash, "source_sha256": source_sha256,
+            "rubric": rubric, "inventory": inventory,
             "candidates": [{
                 "idx": c["idx"], "knobs": c["knobs"], "features": feats[c["idx"]],
                 "reward_obj": c["critic"]["reward"], "taste_score": scores[c["idx"]],
                 "overall_obj": c["critic"]["overall_score"],
                 "dense_obj": round(sum(e["reward_delta"] for e in c["critic"]["elements"]), 4),
                 "n_segments": len(c["schema"]["structure"]),
+                "schema": c["schema"],
             } for c in cands],
         })
 
@@ -1074,6 +1231,10 @@ def main() -> int:
                         "effect preference; logs under video/v2 by default")
     p.add_argument("--no-log", action="store_true", help="do not append the group to the dataset")
 
+    p = sub.add_parser("replay", help="re-derive logged groups and check the record")
+    p.add_argument("dataset")
+    p.add_argument("--limit", type=int, default=0, help="check at most N groups")
+
     p = sub.add_parser("render")
     p.add_argument("src"); p.add_argument("schema"); p.add_argument("out")
 
@@ -1167,6 +1328,8 @@ def main() -> int:
                                  select=args.select, log=not args.no_log,
                                  refine=args.refine, feature_spec=args.feature_spec,
                                  effect_grid=args.effect_grid)
+        elif args.cmd == "replay":
+            result = cmd_replay(args.dataset, args.limit or None)
         elif args.cmd == "render":
             result = cmd_render(args.src, json.loads(args.schema), args.out)
         elif args.cmd == "review_frames":

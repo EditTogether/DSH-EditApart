@@ -552,6 +552,129 @@ class TestEffectGrid(unittest.TestCase):
                         "no candidate carries an effect knob")
 
 
+class TestLogReplay(unittest.TestCase):
+    """A logged group must be re-derivable from the record alone.
+
+    The log used to keep only derived numbers — no rubric, no inventory, no timeline,
+    no source identity — so a defect in the feature extractor or a change to the critic
+    made the whole corpus un-remeasurable and would have forced a re-shoot. This
+    project's own corrections log is a history of exactly that: three conclusions
+    flipped after defects, and each had to be re-measured on the same data. Schema v3
+    keeps the constraints, the evidence and the timelines; `replay` recomputes from
+    them and compares. These tests are the acceptance criterion for "we keep the raws".
+    """
+
+    INVENTORY = {"source": "synthetic",
+                 "shots": [{"shot": f"clip_{i:03d}", "start": float(2 * i),
+                            "end": float(2 * i + 2), "duration": 2.0,
+                            "features": {"motion": 0.5, "lum": 0.5, "rms": -20.0}}
+                           for i in range(8)]}
+    RUBRIC = {"intent": "test", "pace": "medium", "min_shot_dur": 0.8,
+              "max_shot_dur": 4.0, "target_duration": 16.0, "no_shot_under_s": 0.9}
+
+    def _log(self, path: str, inventory: dict | None = None):
+        import edit_apart_core as core
+        core.cmd_propose(inventory or self.INVENTORY, self.RUBRIC, group=4,
+                         dataset=path, clip_id="c1", effect_grid=True)
+        return core
+
+    def test_a_logged_group_replays_exactly(self):
+        import edit_apart_core as core
+        with tempfile.TemporaryDirectory() as d:
+            dataset = os.path.join(d, "v3.jsonl")
+            self._log(dataset)
+            report = core.cmd_replay(dataset)
+        self.assertEqual(report["groups"], 1)
+        self.assertEqual(report["not_replayable"], 0, "a fresh v3 record must be replayable")
+        self.assertEqual(report["mismatches"], [])
+        self.assertEqual(report["features_match"], report["candidates_checked"])
+        self.assertEqual(report["rewards_match"], report["candidates_checked"])
+        self.assertTrue(report["ok"])
+
+    def test_the_record_carries_what_a_replay_needs(self):
+        with tempfile.TemporaryDirectory() as d:
+            dataset = os.path.join(d, "v3.jsonl")
+            self._log(dataset)
+            with open(dataset, encoding="utf-8") as fh:
+                rec = json.loads(fh.readline())
+        self.assertGreaterEqual(rec["dataset_schema_version"], 3)
+        for key in ("rubric", "inventory", "rubric_hash", "inventory_hash",
+                    "content_hash", "selected", "engine"):
+            self.assertIn(key, rec, f"{key} is required to replay a group")
+        for cand in rec["candidates"]:
+            self.assertIsInstance(cand.get("schema"), dict,
+                                  "the TIMELINE must be in the record, not just its knobs")
+
+    def test_content_hash_is_deterministic_but_group_id_is_not(self):
+        """The content hash is what a ledger keys annotations to — two runs of the same
+        proposal must agree on it, while `group_id` stays instance-unique."""
+        import edit_apart_core as core
+        with tempfile.TemporaryDirectory() as d:
+            first, second = os.path.join(d, "a.jsonl"), os.path.join(d, "b.jsonl")
+            self._log(first)
+            self._log(second)
+            records = []
+            for path in (first, second):
+                with open(path, encoding="utf-8") as fh:
+                    records.append(json.loads(fh.readline()))
+        self.assertEqual(records[0]["content_hash"], records[1]["content_hash"])
+        self.assertNotEqual(records[0]["group_id"], records[1]["group_id"])
+
+    def test_replay_detects_feature_drift(self):
+        """The negative control: a stale/incorrect stored vector must be caught."""
+        import edit_apart_core as core
+        with tempfile.TemporaryDirectory() as d:
+            dataset = os.path.join(d, "v3.jsonl")
+            self._log(dataset)
+            with open(dataset, encoding="utf-8") as fh:
+                rec = json.loads(fh.readline())
+            rec["candidates"][0]["features"]["mean_shot_dur"] += 0.5      # corrupt the log
+            with open(dataset, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec) + "\n")
+            report = core.cmd_replay(dataset)
+        self.assertEqual(report["clean"], 0)
+        self.assertTrue(report["mismatches"], "feature drift went undetected")
+        self.assertIn("features[0]", report["mismatches"][0]["problems"])
+        self.assertFalse(report["ok"])
+
+    def test_source_media_is_identified_by_hash_and_drift_is_caught(self):
+        """Keeping the raws only counts if we can tell they are the SAME raws."""
+        import edit_apart_core as core
+        with tempfile.TemporaryDirectory() as d:
+            media = os.path.join(d, "source.mp4")
+            with open(media, "wb") as fh:
+                fh.write(b"not really an mp4, but a stable identity")
+            inventory = {**self.INVENTORY, "source": media}
+            good = os.path.join(d, "good.jsonl")
+            self._log(good, inventory)
+            report = core.cmd_replay(good)
+            self.assertEqual(report["source_hash_checked"], 1)
+            self.assertEqual(report["mismatches"], [])
+            with open(media, "ab") as fh:                                  # the raw changed
+                fh.write(b" ...edited")
+            drifted = core.cmd_replay(good)
+        self.assertTrue(drifted["mismatches"], "a changed source went undetected")
+        self.assertIn("source_sha256", drifted["mismatches"][0]["problems"])
+
+    def test_replay_reports_older_records_as_not_replayable(self):
+        """No guessing: a record without the timeline/evidence says so explicitly."""
+        import edit_apart_core as core
+        legacy = {"kind": "group", "group_id": "g0", "clip_id": "c0",
+                  "feature_spec": tm.FEATURE_SPEC_VIDEO,
+                  "candidates": [{"idx": 0, "knobs": {}, "features": {"mean_shot_dur": 0.3},
+                                  "reward_obj": 0.4, "overall_obj": 0.4, "dense_obj": 0.0}]}
+        with tempfile.TemporaryDirectory() as d:
+            dataset = os.path.join(d, "old.jsonl")
+            with open(dataset, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(legacy) + "\n")
+            report = core.cmd_replay(dataset)
+        self.assertEqual(report["groups"], 1)
+        self.assertEqual(report["not_replayable"], 1)
+        self.assertEqual(report["replayable"], 0)
+        self.assertEqual(report["mismatches"], [], "an old record is not a failure")
+        self.assertFalse(report["ok"], "but it is not a passing replay either")
+
+
 class TestGGUF(unittest.TestCase):
     def test_round_trip_bit_exact(self):
         with tempfile.TemporaryDirectory() as d:

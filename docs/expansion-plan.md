@@ -130,6 +130,30 @@ for rhythm — the same reason EditApart's group log is per-clip, not per-tweak.
 | **beat / emotion** | markers | the one column that spans shots; rendered with a colour scale so a row's role is visible when scanning |
 | why | operation rationale | the field that turns a list of actions into a record of *judgement* |
 
+## 6b. What the training datum is, and what must be retained
+
+A datum is a **group** — alternatives under one fixed request/materials/constraint set —
+never a timeline plus a scalar. Implemented in the current engine as dataset schema v3
+(README, "The training datum"), designed here for the NLE case:
+
+- **Structure** lives in the timeline (OTIO's own container when canonical:
+  `otio_json`/`otiod`/`otioz`), because adapters strip — measured, FCPXML writes none of
+  our effects, markers or metadata.
+- **Judgment** (`why`, decisions, provenance, rewards) lives in the **ledger**, keyed by
+  the timeline's content hash. It must not depend on surviving a round trip.
+- **Evidence** (the inventory: per-shot motion/luma/rms) and the **constraints** (the
+  rubric) travel with the group, because they are what the features and the reward are
+  computed from.
+- **Raws** are identified by content hash with their available range, so a re-score can
+  tell "same source" from "different source" — and three rules follow: media garbage
+  collection must be training-aware (never prune a source a logged group references),
+  a reward is recomputed only after hash verification (else the group is marked
+  non-recomputable), and a render is a disposable cache, never the record.
+
+The acceptance test for all of it is `replay`: re-derive a group from its own record and
+compare. A pipeline that cannot replay cannot re-measure, and this project's corrections
+log is a history of needing to re-measure.
+
 ## 7. The taste layer over a timeline
 
 **Status: the effect half of this section is IMPLEMENTED (2026-09).** `video/v2` adds

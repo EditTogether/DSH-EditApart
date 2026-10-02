@@ -385,6 +385,12 @@ The persona and tool catalog already describe them; prefer these over running
 - If a render command fails, read the ffmpeg error and fix the **graph**, not
   the schema, unless the schema is genuinely invalid.
 - Keep the loop bounded; report convergence or the final pass's score honestly.
+- **If the logged numbers look wrong, replay them.** Group records are schema v3:
+  they carry the rubric, the inventory, the timelines and the source hash, so
+  `python bin/edit_apart_core.py replay <dataset.jsonl>` re-derives every candidate's
+  features and reward and reports any drift (including a changed source file). Older
+  records are reported as *not replayable* rather than re-derived by guesswork — say
+  so instead of trusting them.
 - **If groups look degenerate, check the environment before blaming the model.**
   A mis-resolved toolchain can silently zero a whole feature family (an
   ImageMagick 6 `convert` asked for dimensions used to return 0x0, which killed

@@ -415,6 +415,8 @@ EFFECT_CANDIDATE_GRID = (
     {"transition": "dissolve", "transition_dur": 0.8, "transition_align": "start"},
     {"transition": "dissolve", "transition_dur": 0.5, "transition_align": "end"},
     {"grade": 1.0},
+    {"lut": "warm"},                       # rendered: luts/warm.cube
+    {"lut": "cool"},
 )
 
 #: The axes swept by the refiner, in a FIXED order so a run is reproducible.
@@ -484,6 +486,8 @@ def apply_effects(schema: dict, knobs: dict) -> dict:
             eq = seg.setdefault("grade", {}).setdefault("eq", {})
             eq["saturation"] = round(1.0 + 0.10 * grade, 4)
             eq["contrast"] = round(0.05 * grade, 4)
+        if knobs.get("lut"):
+            seg.setdefault("grade", {})["lut"] = str(knobs["lut"])
     return schema
 
 
@@ -504,6 +508,9 @@ def knobs_from_schema(schema: dict) -> dict:
         sat = float(eq.get("saturation", 1.0) or 1.0)
         if abs(sat - 1.0) > 1e-9:
             knobs["grade"] = round((sat - 1.0) / 0.10, 3)
+        lut = (seg.get("grade") or {}).get("lut")
+        if lut:
+            knobs["lut"] = str(lut)
         break
     return knobs
 
@@ -554,6 +561,234 @@ def refine_effects(tm, schema: dict, inventory: dict, rubric: dict, scorer,
         if not improved:
             break
     return {"schema": best, "knobs": knobs, "trace": trace, "score": round(best_score, 6)}
+
+
+# ── per-effect credit ───────────────────────────────────────────────────────
+# What varies between the candidates of ONE group, slot by slot. Rows are
+# (segment index, slot): a transition, a grade, a level or a transform belongs to a
+# segment, so the table is element-local by construction. The diff says WHICH
+# decision differed (and is the ONLY witness for a parameter-only change — no
+# keep/drop is ever emitted for a value change), the critic's per-element deltas give
+# the sign and the basis, and the group-relative advantage gives the magnitude.
+ELEMENT_SLOTS = ("transition.type", "transition.dur", "transition.alignment",
+                 "grade.lut", "grade.eq", "audio.level", "audio.duck",
+                 "transform.scale", "transform.crop", "overlay")
+
+#: A slot is "declared" when at least one candidate carries a non-default value;
+#: an all-default row is not a decision and is omitted (it would inflate the table
+#: with thousands of identical rows).
+_SLOT_DEFAULTS = {"transition.type": "cut", "transition.dur": 0.0,
+                  "transition.alignment": "center", "grade.lut": None,
+                  "grade.eq": "{}", "audio.level": 1.0, "audio.duck": 0.0,
+                  "transform.scale": 1.0, "transform.crop": None, "overlay": "[]"}
+
+
+def _advantages(rewards: list) -> list[float]:
+    """Zero-mean unit-scale group advantage, in pure Python.
+
+    Deliberately the same definition the trainer uses (`taste_model.group_advantage`)
+    so an attribution row's magnitude means the same thing as a training signal;
+    `TestEffectCredit` asserts the two agree rather than trusting that they do.
+    """
+    values = [float(r or 0.0) for r in rewards]
+    if len(values) < 2:
+        return [0.0] * len(values)
+    mean = sum(values) / len(values)
+    variance = sum((v - mean) ** 2 for v in values) / len(values)
+    std = variance ** 0.5
+    if std < 1e-12:
+        return [0.0] * len(values)
+    return [(v - mean) / std for v in values]
+
+
+def _slot_value(schema: dict, index: int, slot: str):
+    segs = schema.get("structure") or []
+    if index >= len(segs):
+        return None
+    seg = segs[index]
+    transition = seg.get("transition") or {}
+    grade = seg.get("grade") or {}
+    audio = seg.get("audio") or {}
+    transform = seg.get("transform") or {}
+    table = {
+        "transition.type": transition.get("type") or "cut",
+        "transition.dur": round(float(transition.get("dur") or 0.0), 6),
+        "transition.alignment": (transition.get("params") or {}).get("alignment") or "center",
+        "grade.lut": grade.get("lut"),
+        "grade.eq": json.dumps(grade.get("eq") or {}, sort_keys=True),
+        "audio.level": round(float(audio.get("level", 1.0) or 1.0), 6),
+        "audio.duck": round(float(audio.get("duck") or 0.0), 6),
+        "transform.scale": round(float(transform.get("scale", 1.0) or 1.0), 6),
+        "transform.crop": transform.get("crop"),
+        "overlay": json.dumps(seg.get("overlay") or [], sort_keys=True),
+    }
+    return table[slot]
+
+
+def attribute_credit(group: dict, rewards: list[dict] | None = None) -> dict:
+    """The per-group attribution table: changed?, why, and how much it counted.
+
+    Rows are keyed by SHOT, not by index. Candidates of one group can select
+    different numbers of shots, so index 6 of one candidate is a different shot from
+    index 6 of another — an index-keyed diff reports phantom changes (a real value
+    against None) and would attribute them to an effect. `values` is reported for
+    every candidate so `changed` is checkable rather than asserted; `advantages`
+    carries the group-relative advantage per candidate; and where the render recorded
+    a judgement for that segment (`elements`), the critic's
+    `decision`/`why`/`reward_delta` is attached to the row.
+
+    `attributable` is the flag a credit rule must check: exactly ONE slot kind
+    differed AND the candidates selected the same shots. A group that varies several
+    decisions, or that changed its material as well, cannot have its advantage
+    attributed to any single decision.
+    """
+    cands = group.get("candidates") or []
+    rewards = rewards or []
+    if not cands:
+        return {"group_id": group.get("group_id"), "rows": [], "changed_rows": [],
+                "changed_slots": [], "axes_changed": 0, "selection_changed": False,
+                "attributable": False}
+    advantages = _advantages([c.get("reward_obj") for c in cands])
+    judgements: dict[str, dict] = {}
+    for record in rewards:
+        for element in record.get("elements") or []:
+            key = str(element.get("shot"))
+            judgements.setdefault(key, {})[str(record.get("candidate"))] = {
+                "decision": element.get("decision"), "why": element.get("why"),
+                "reward_delta": element.get("reward_delta")}
+    shot_ids: list = []
+    per_candidate = [_shot_ids(c.get("schema") or {}) for c in cands]
+    for shots in per_candidate:
+        for shot in shots:
+            if shot not in shot_ids:
+                shot_ids.append(shot)
+    selection_changed = len({tuple(shots) for shots in per_candidate}) > 1
+    rows: list[dict] = []
+    for shot in shot_ids:
+        for slot in ELEMENT_SLOTS:
+            values = []
+            for candidate, shots in zip(cands, per_candidate):
+                index = shots.index(shot) if shot in shots else None
+                values.append(None if index is None
+                              else _slot_value(candidate.get("schema") or {}, index, slot))
+            present = [v for v in values if v is not None]
+            default = _SLOT_DEFAULTS[slot]
+            if not present or all(
+                    json.dumps(v, sort_keys=True) == json.dumps(default, sort_keys=True)
+                    for v in present):
+                continue
+            changed = len({json.dumps(v, sort_keys=True) for v in values}) > 1
+            row = {"shot": shot, "slot": slot, "changed": changed, "values": values,
+                   "advantages": [round(a, 6) for a in advantages]}
+            if str(shot) in judgements:
+                row["judgements"] = judgements[str(shot)]
+            rows.append(row)
+    changed_rows = [f"{r['shot']}:{r['slot']}" for r in rows if r["changed"]]
+    changed_slots = sorted({r["slot"] for r in rows if r["changed"]})
+    # The AXIS comes from the logged knobs, so a COUPLED decision counts once:
+    # transition type/duration/alignment are one decision (a duration is meaningless
+    # without the type) and they legitimately move together, which a slot count would
+    # misreport as three decisions.
+    selection_keys = {"target_factor", "min_shot_factor", "skip_short", "keep_max"}
+    knobs = [{k: v for k, v in (c.get("knobs") or {}).items() if k not in selection_keys}
+             for c in cands]
+    varying = sorted({k for k in {key for knob in knobs for key in knob}
+                      if len({json.dumps(knob.get(k), sort_keys=True)
+                              for knob in knobs}) > 1})
+    return {"group_id": group.get("group_id"), "feature_spec": group.get("feature_spec"),
+            "rows": rows, "changed_rows": changed_rows, "changed_slots": changed_slots,
+            "axes_changed": len(changed_slots), "knob_axis": varying,
+            "selection_changed": selection_changed,
+            "attributable": bool(varying) and not selection_changed}
+
+
+def _shot_ids(schema: dict) -> list:
+    """The shot identity of each segment, in order — how candidates are aligned."""
+    return [seg.get("shot") for seg in (schema.get("structure") or [])]
+
+
+def effect_credit_profile(dataset: str, identity: str | None = None,
+                          style: str | None = None, limit: int | None = None) -> dict:
+    """What the rewards (and a trained identity) prefer, effect by effect.
+
+    The axis comes from the LOGGED KNOBS, not from re-diffing the schemas: a knob
+    whose value differs across the candidates names the axis, and each value it took
+    is a bucket. That keeps coupled parameters honest (transition type and duration
+    are one decision, so they are one axis with labelled values) and it cannot invent
+    an axis out of a numeric coincidence.
+
+    A group whose candidates selected DIFFERENT shots is counted and skipped: its
+    material changed as well as its effects, so its advantage cannot be attributed to
+    an effect at all. Folding such a group in would turn an unattributable number
+    into a claim — which is why `--effect-grid` holds the selection fixed.
+    """
+    tm = _taste()
+    scorer = None
+    if identity:
+        scorer = tm.TasteScorer.load(identity, style)
+    groups: list[dict] = []
+    if not os.path.isfile(dataset):
+        raise FileNotFoundError(f"dataset not found: {dataset}")
+    with open(dataset, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("kind") == "group":
+                groups.append(record)
+    if limit is not None:
+        groups = groups[:int(limit)]
+    selection_keys = {"target_factor", "min_shot_factor", "skip_short", "keep_max"}
+    profile: dict[str, dict] = {}
+    report = {"dataset": dataset, "groups": 0, "attributed_groups": 0,
+              "selection_confounded_groups": 0, "no_change_groups": 0,
+              "identity": identity, "axes": profile}
+    for group in groups:
+        report["groups"] += 1
+        cands = group.get("candidates") or []
+        if len(cands) < 2:
+            report["no_change_groups"] += 1
+            continue
+        if len({tuple(_shot_ids(c.get("schema") or {})) for c in cands}) > 1:
+            report["selection_confounded_groups"] += 1
+            continue
+        knobs = [{k: v for k, v in (c.get("knobs") or {}).items()
+                  if k not in selection_keys} for c in cands]
+        keys = sorted({k for knob in knobs for k in knob})
+        if not keys:
+            report["no_change_groups"] += 1
+            continue
+        varying = sorted(k for k in keys if len({json.dumps(knob.get(k), sort_keys=True)
+                                                 for knob in knobs}) > 1)
+        if not varying:
+            report["no_change_groups"] += 1
+            continue
+        axis = "+".join(varying)
+        report["attributed_groups"] += 1
+        for candidate, knob in zip(cands, knobs):
+            value = [knob.get(k) for k in varying]
+            key = json.dumps(value)
+            bucket = profile.setdefault(axis, {}).setdefault(
+                key, {"value": value, "n": 0, "reward_sum": 0.0,
+                      "taste_sum": 0.0, "taste_n": 0})
+            bucket["n"] += 1
+            bucket["reward_sum"] += float(candidate.get("reward_obj") or 0.0)
+            if scorer is not None and candidate.get("features"):
+                bucket["taste_sum"] += float(scorer.score_features(candidate["features"]))
+                bucket["taste_n"] += 1
+    for buckets in profile.values():
+        for bucket in buckets.values():
+            count = max(1, bucket["n"])
+            bucket["reward_mean"] = round(bucket.pop("reward_sum") / count, 6)
+            taste_n = bucket.pop("taste_n")
+            taste_sum = bucket.pop("taste_sum")
+            if taste_n:
+                bucket["taste_mean"] = round(taste_sum / taste_n, 6)
+    return report
 
 
 def cmd_replay(dataset: str, limit: int | None = None) -> dict:
@@ -688,6 +923,14 @@ def cmd_propose(inventory: dict, rubric: dict, group: int = 1, identity: str | N
     clip = clip_id or str(inventory.get("source") or "")
     cands = []
     for i, (target_factor, min_factor, skip_short, keep_max) in enumerate(grid):
+        # `--effect-grid` varies ONLY the effects: every candidate keeps the SAME shot
+        # selection, so one group differs in exactly one decision and its advantage is
+        # attributable to that decision. Pairing the selection grid with the effect grid
+        # (the previous behaviour) made every candidate differ in material AND effects,
+        # which no attribution rule can untangle — exploring both dimensions is two
+        # proposals, not one.
+        if effect_grid:
+            target_factor, min_factor, skip_short, keep_max = grid[0]
         schema = _propose_variant(inventory, rubric, target_factor, min_factor,
                                   skip_short, keep_max)
         effect_knobs = {}
@@ -846,10 +1089,43 @@ def _has_audio(src: str) -> bool:
 #: `position` needs a canvas), they are declared-but-unrendered and REFUSED.
 UNRENDERED_FIELDS = {
     "audio.duck": "no music bed is mixed, so there is nothing to duck under",
-    "grade.lut": "no LUT is shipped or referenced",
     "overlay": "no overlay media is referenced",
     "transform.position": "the output canvas is the source frame; there is nowhere to place a layer",
 }
+
+#: Directory holding the shipped `.cube` LUTs (generated by tools/make_luts.py).
+#: `DSH_EDITAPART_LUTS` overrides it, so an operator can point at their own grade.
+LUT_DIR = os.environ.get("DSH_EDITAPART_LUTS") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "luts")
+
+
+def resolve_lut(value: object) -> str | None:
+    """Map a `grade.lut` value to a real `.cube` file, or None.
+
+    A bare name resolves inside `LUT_DIR` (`"warm"` -> `luts/warm.cube`); anything
+    with a path separator or a `.cube` suffix is taken as a path. None means "this
+    grade cannot be applied", which the gate turns into a refusal rather than a
+    silently ungraded render.
+    """
+    if value in (None, "", False):
+        return None
+    text = str(value)
+    candidates = []
+    if os.sep in text or text.lower().endswith(".cube"):
+        candidates.append(text)
+    else:
+        candidates.append(os.path.join(LUT_DIR, f"{text}.cube"))
+    candidates.append(os.path.join(LUT_DIR, text))
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _ff_path(path: str) -> str:
+    """Escape a filesystem path for an ffmpeg filtergraph argument."""
+    return (path.replace("\\", "\\\\").replace(":", "\\:")
+            .replace(",", "\\,").replace("'", "\\'").replace("[", "\\[").replace("]", "\\]"))
 
 
 def assert_renderable(schema: dict) -> None:
@@ -876,10 +1152,13 @@ def assert_renderable(schema: dict) -> None:
             raise RuntimeError(
                 f"structure[{i}].audio.duck is declared but not rendered: "
                 f"{UNRENDERED_FIELDS['audio.duck']}")
-        if (seg.get("grade") or {}).get("lut"):
+        lut = (seg.get("grade") or {}).get("lut")
+        if lut and resolve_lut(lut) is None:
             raise RuntimeError(
-                f"structure[{i}].grade.lut is declared but not rendered: "
-                f"{UNRENDERED_FIELDS['grade.lut']}")
+                f"structure[{i}].grade.lut={lut!r} cannot be applied: no .cube file "
+                f"resolves to it (searched {LUT_DIR!r}; a bare name means "
+                f"<dir>/<name>.cube). An ungraded render logged as a graded decision is "
+                "the same defect as any other field the renderer does not execute.")
         if seg.get("overlay"):
             raise RuntimeError(
                 f"structure[{i}].overlay is declared but not rendered: "
@@ -1006,6 +1285,12 @@ def cmd_render(src: str, schema: dict, out: str) -> dict:
                   for k in ("brightness", "contrast", "saturation", "gamma") if k in eq]
         if eqopts:
             parts.append("eq=" + ":".join(eqopts))
+        lut = grade.get("lut")
+        if lut:
+            lut_path = resolve_lut(lut)
+            if lut_path is None:
+                raise RuntimeError(f"structure[{i}].grade.lut={lut!r} does not resolve")
+            parts.append(f"lut3d=file={_ff_path(lut_path)}")
         seg_parts.append(parts)
         v_filter.append(f"[{s}:v]" + ",".join(parts) + f",format=yuv420p[v{i}]")
         in_labels.append(f"[v{i}]")
@@ -1255,6 +1540,11 @@ def cmd_critic(schema: dict, inventory: dict, rubric: dict,
         _log_jsonl(dataset, {
             "kind": "reward", "group_id": group_id, "candidate": idx,
             "chosen_by": chosen_by,
+            # The critic's per-ELEMENT judgement, not just its sum (`dense_obj`): the
+            # decision (`keep`/`drop`), the reason, and the delta. Without it the log
+            # records the magnitude of a judgement and loses its basis, which is what
+            # a per-effect attribution row needs to explain itself.
+            "elements": out.get("elements") or [],
             "reward": out["reward"], "objective_reward": out["reward"],
             "overall_obj": out["overall_score"],
             "dense_obj": round(sum(e["reward_delta"] for e in out["elements"]), 4),
@@ -1466,6 +1756,15 @@ def main() -> int:
                         "effect preference; logs under video/v2 by default")
     p.add_argument("--no-log", action="store_true", help="do not append the group to the dataset")
 
+    p = sub.add_parser("attribute", help="per-effect credit: what changed, why, and its weight")
+    p.add_argument("dataset")
+    p.add_argument("--identity", default=os.getenv("DSH_EDITAPART_IDENTITY"))
+    p.add_argument("--style", default=os.getenv("DSH_EDITAPART_STYLE"))
+    p.add_argument("--group-id", default=None,
+                   help="print the per-slot attribution TABLE for this group instead "
+                        "of the corpus-wide effect profile")
+    p.add_argument("--limit", type=int, default=0)
+
     p = sub.add_parser("replay", help="re-derive logged groups and check the record")
     p.add_argument("dataset")
     p.add_argument("--limit", type=int, default=0, help="check at most N groups")
@@ -1563,6 +1862,27 @@ def main() -> int:
                                  select=args.select, log=not args.no_log,
                                  refine=args.refine, feature_spec=args.feature_spec,
                                  effect_grid=args.effect_grid)
+        elif args.cmd == "attribute":
+            if args.group_id:
+                group, reward_records = None, []
+                with open(args.dataset, encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        record = json.loads(line)
+                        if (record.get("kind") == "group"
+                                and str(record.get("group_id")) == str(args.group_id)):
+                            group = record
+                        elif (record.get("kind") == "reward"
+                              and str(record.get("group_id")) == str(args.group_id)):
+                            reward_records.append(record)
+                if group is None:
+                    raise SystemExit(f"no group {args.group_id!r} in {args.dataset}")
+                result = attribute_credit(group, reward_records)
+            else:
+                result = effect_credit_profile(args.dataset, args.identity, args.style,
+                                               args.limit or None)
         elif args.cmd == "replay":
             result = cmd_replay(args.dataset, args.limit or None)
         elif args.cmd == "render":

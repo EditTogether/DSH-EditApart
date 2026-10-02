@@ -25,6 +25,7 @@
     "plugins/",
     "bin/",
     "skills/",
+    "luts/",
     "docs/",
     "tests/",
     "README.md",

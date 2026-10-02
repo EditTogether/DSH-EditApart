@@ -156,7 +156,12 @@ log is a history of needing to re-measure.
 
 ## 7. The taste layer over a timeline
 
-**Status: the effect half of this section is IMPLEMENTED (2026-09).** `video/v2` adds
+**Status: the effect half of this section is IMPLEMENTED (2026-09), and per-effect
+credit is implemented as an ATTRIBUTION TABLE plus a corpus-wide effect profile
+(`edit_apart_core.py attribute`) whose rows are keyed by shot and whose axis comes from
+the logged knobs, with `attributable` false for any group that varied several decisions
+or changed its material.** The remaining piece is gradient-level: distributing a group's
+advantage over the table's rows instead of broadcasting it over the candidate. ** `video/v2` adds
 the effect-parameter features and `propose_schema(refine=N)` lets an effect-aware
 identity choose those parameters by deterministic coordinate ascent — see the README's
 "Multi-input effects" section for what is measured and what is still missing

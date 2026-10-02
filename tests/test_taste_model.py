@@ -650,6 +650,157 @@ class TestRenderedEffectContract(unittest.TestCase):
         self.assertAlmostEqual(feats["transition_frac"], 1.0, places=9)
 
 
+class TestEffectCredit(unittest.TestCase):
+    """Credit attributed to the decision that actually varied.
+
+    Two properties make the difference between a real attribution and a plausible
+    one. Rows are keyed by SHOT: candidates of a group can select different numbers
+    of shots, so index 6 of one candidate is a different shot from index 6 of another
+    and an index-keyed diff invents changes (a real value against None) and blames
+    them on an effect. And the axis comes from the logged KNOBS, because a coupled
+    decision — transition type/duration/alignment — legitimately moves together; a
+    slot count would misreport it as three independent decisions.
+    """
+
+    INVENTORY = {"source": "synthetic",
+                 "shots": [{"shot": f"clip_{i:03d}", "start": float(2 * i),
+                            "end": float(2 * i + 2), "duration": 2.0,
+                            "features": {"motion": 0.5, "lum": 0.5, "rms": -20.0}}
+                           for i in range(8)]}
+    RUBRIC = {"intent": "test", "pace": "medium", "min_shot_dur": 0.8,
+              "max_shot_dur": 4.0, "target_duration": 16.0, "no_shot_under_s": 0.9}
+
+    def _log(self, path, effect_grid=True, group=4, clip="c1"):
+        import edit_apart_core as core
+        core.cmd_propose(self.INVENTORY, self.RUBRIC, group=group, dataset=path,
+                         clip_id=clip, effect_grid=effect_grid)
+        with open(path, encoding="utf-8") as fh:
+            return json.loads(fh.readline())
+
+    def test_advantages_match_the_trainer(self):
+        """The pure-Python attribution advantage must equal the training definition."""
+        import edit_apart_core as core
+        rewards = [0.2, -0.5, 1.1, 0.4]
+        mine = core._advantages(rewards)
+        theirs = [float(a) for a in tm.group_advantage(np.array(rewards))]
+        # The same definition, evaluated in pure Python vs numpy: equal to floating-point
+        # tolerance, which is what "the same" means for a magnitude.
+        for got, expected in zip(mine, theirs):
+            self.assertAlmostEqual(got, expected, places=7)
+
+    def test_effect_grid_holds_the_selection_so_credit_is_attributable(self):
+        import edit_apart_core as core
+        with tempfile.TemporaryDirectory() as d:
+            record = self._log(os.path.join(d, "eff.jsonl"))
+            table = core.attribute_credit(record)
+        shot_lists = {tuple(seg["shot"] for seg in c["schema"]["structure"])
+                      for c in record["candidates"]}
+        self.assertEqual(len(shot_lists), 1,
+                         "an effect group must keep the same material for every candidate")
+        self.assertFalse(table["selection_changed"])
+        self.assertTrue(table["knob_axis"], "the varying knob set names the axis")
+        self.assertTrue(table["attributable"])
+        self.assertTrue(table["changed_rows"], "nothing was reported as changed")
+        # rows are keyed by shot, and every shot id is a real one
+        for row in table["rows"]:
+            self.assertIn(row["shot"], {seg["shot"] for seg in
+                                        record["candidates"][0]["schema"]["structure"]})
+        # the advantages are zero-mean and unit-scale, like the training signal
+        advantages = table["rows"][0]["advantages"]
+        self.assertAlmostEqual(sum(advantages) / len(advantages), 0.0, places=6)
+
+    def test_a_selection_varying_group_is_not_attributable(self):
+        """Different material means the advantage cannot be blamed on an effect."""
+        import edit_apart_core as core
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "sel.jsonl")
+            record = self._log(path, effect_grid=False)
+            table = core.attribute_credit(record)
+            profile = core.effect_credit_profile(path)
+        self.assertTrue(table["selection_changed"])
+        self.assertFalse(table["attributable"])
+        self.assertEqual(profile["attributed_groups"], 0)
+        self.assertEqual(profile["selection_confounded_groups"], 1)
+
+    def test_the_profile_separates_the_axis_values(self):
+        import edit_apart_core as core
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "many.jsonl")
+            for clip in range(3):
+                self._log(path, clip=f"c{clip}")
+            profile = core.effect_credit_profile(path)
+        self.assertEqual(profile["groups"], 3)
+        self.assertEqual(profile["attributed_groups"], 3)
+        self.assertEqual(len(profile["axes"]), 1, "the grid varies one coupled decision")
+        axis, buckets = next(iter(profile["axes"].items()))
+        self.assertIn("transition_dur", axis)
+        values = {json.dumps(b["value"]) for b in buckets.values()}
+        self.assertGreaterEqual(len(values), 3, "the grid's values must be separated")
+        for bucket in buckets.values():
+            self.assertEqual(bucket["n"], 3)
+            self.assertIn("reward_mean", bucket)
+
+    def test_the_critic_cannot_see_a_transition(self):
+        """Documents WHY the taste model has to learn effects from external picks: the
+        objective critic scores duration/motion/target, so every transition value in a
+        group earns the same reward. If this ever stops being flat, the critic grew a
+        transition-aware leg and the attribution story changes."""
+        import edit_apart_core as core
+        with tempfile.TemporaryDirectory() as d:
+            record = self._log(os.path.join(d, "flat.jsonl"))
+            profile = core.effect_credit_profile(os.path.join(d, "flat.jsonl"))
+        rewards = {c.get("reward_obj") for c in record["candidates"]}
+        self.assertEqual(len(rewards), 1, f"the objective critic is transition-blind: {rewards}")
+        for buckets in profile["axes"].values():
+            self.assertEqual(len({b["reward_mean"] for b in buckets.values()}), 1)
+
+
+class TestLutRendering(unittest.TestCase):
+    """`grade.lut` is a RENDERED field: it resolves to a real `.cube` or it is refused.
+
+    The LUTs are generated text, so the grade they apply is reviewable in a diff and
+    reproducible; `--check` catches a hand-edited LUT that does not match its
+    generator. A name that resolves to nothing is refused rather than silently
+    ungraded, for the same reason as any other unrendered field.
+    """
+
+    def _schema(self, lut):
+        seg = {"trim": {"in": 0.0, "out": 2.0}, "retime": 0.0,
+               "timeline": {"in": 0.0, "out": 2.0},
+               "transition": {"type": "cut", "dur": 0.0, "params": {}},
+               "transform": {"scale": 1.0, "crop": None, "position": None},
+               "grade": {"lut": lut, "eq": {}},
+               "audio": {"level": 1.0, "duck": 0.0, "fade": 0.0}, "overlay": []}
+        return {"structure": [dict(seg), dict(seg)]}
+
+    def test_the_shipped_luts_match_their_generator(self):
+        import subprocess
+        r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "make_luts.py"),
+                            "--check"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, f"stale LUTs: {r.stderr}")
+
+    def test_a_bare_name_resolves_and_an_unknown_one_does_not(self):
+        import edit_apart_core as core
+        warm = core.resolve_lut("warm")
+        self.assertIsNotNone(warm)
+        self.assertTrue(warm.endswith("warm.cube"))
+        self.assertTrue(os.path.isfile(warm))
+        self.assertIsNone(core.resolve_lut("definitely-not-a-lut"))
+
+    def test_the_gate_accepts_a_resolvable_lut_and_refuses_an_unknown_one(self):
+        import edit_apart_core as core
+        core.assert_renderable(self._schema("warm"))
+        core.assert_renderable(self._schema("cool"))
+        with self.assertRaises(RuntimeError):
+            core.assert_renderable(self._schema("definitely-not-a-lut"))
+
+    def test_lut_frac_reflects_a_declared_lut(self):
+        feats = tm.features_for(tm.FEATURE_SPEC_VIDEO_V2, self._schema("warm"), {}, {})
+        self.assertEqual(feats["lut_frac"], 1.0)
+        plain = tm.features_for(tm.FEATURE_SPEC_VIDEO_V2, self._schema(None), {}, {})
+        self.assertEqual(plain["lut_frac"], 0.0)
+
+
 class TestLogReplay(unittest.TestCase):
     """A logged group must be re-derivable from the record alone.
 

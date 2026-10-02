@@ -302,11 +302,20 @@ fine-tuned language model.
 - **Only renderable fields exist.** `transition` (cut/dissolve) is rendered —
   `xfade`/`acrossfade` with frame-exact geometry, and `alignment` chooses where the cut
   sits in the window (`start` extends the outgoing shot, `end` shortens the timeline by
-  the full duration, `center` splits it). `audio.duck`, `grade.lut`, `overlay[]` and
-  `transform.position` are declared but NOT rendered: writing a value into them is
+  the full duration, `center` splits it). `grade.lut` is rendered from
+  the shipped, generated LUTs (`"warm"`/`"cool"`; a name that resolves to nothing is
+  refused). `audio.duck`, `overlay[]` and `transform.position` are declared but NOT
+  rendered: writing a value into them is
   refused with a reason, because a logged decision that the picture does not contain is
   worse than a missing feature. Do not invent fields either — the schema contract is
   "every field is renderable", and it is enforced.
+- **Attribute credit before you believe it.** `python bin/edit_apart_core.py attribute
+  <dataset> --group-id <gid>` prints the per-shot table (values per candidate, the
+  critic's why/delta, the advantage); without `--group-id` it prints the corpus-wide
+  effect profile. Read `attributable`: a group that varied several decisions, or that
+  changed its material, has no single-decision credit to give. In an effect group the
+  objective reward is usually FLAT (the critic is transition-blind), so only the
+  identity's `taste_mean` discriminates — that is the column to read.
 - **Effects are decisions too.** Log groups with `feature_spec=video/v2` when the
   edit has multi-input effects worth learning (transitions, ducking, grading,
   overlays): the v1 layout cannot see any of them, so a v1-logged group can never

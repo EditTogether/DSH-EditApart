@@ -692,6 +692,7 @@ def cmd_critic(schema: dict, rubric: dict, result_path: str, subjective: float |
         idx = int(candidate or 0)
         _log_jsonl(dataset, {
             "kind": "reward", "group_id": group_id, "candidate": idx,
+            "elements": out.get("elements") or [],
             "chosen_by": chosen_by, "reward": out["reward"],
             "objective_reward": out["reward"], "overall_obj": out["overall_score"],
             "dense_obj": round(sum(e["reward_delta"] for e in out["elements"]), 4),

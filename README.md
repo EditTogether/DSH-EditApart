@@ -266,22 +266,65 @@ mixed-spec rule.
 — `xfade` between runs, `acrossfade` for the audio, and an outgoing `tpad` extension so
 all three alignments are exact — which is what makes the transition features true: the
 rendered duration equals the planned one to the frame, and the picture at the boundary
-differs from a hard cut. The all-cut path is **byte-identical** to the renderer that
-produced every earlier measurement, so nothing had to be re-measured. The fields the
-renderer still does *not* execute — `audio.duck` (no music bed is mixed), `grade.lut`
-(no LUT), `overlay` (no overlay media), `transform.position` (the output canvas is the
-source frame) — are **declared-but-unrendered** and refused by `assert_renderable` at
-propose, refine and render time, with a reason. That makes the schema's own contract
+differs from a hard cut. `grade.lut` renders too: the repository ships generated
+`.cube` LUTs (`luts/warm.cube`, `luts/cool.cube`, reproducible with
+`tools/make_luts.py --check`), a bare name resolves to one of them and a name that
+resolves to nothing is refused. The all-cut path is **byte-identical** to the renderer
+that produced every earlier measurement, so nothing had to be re-measured. The fields the
+renderer still does *not* execute — `audio.duck` (no music bed is mixed), `overlay` (no
+overlay media), `transform.position` (the output canvas is the source frame) — are
+**declared-but-unrendered** and refused by `assert_renderable` at propose, refine and
+render time, with a reason. That makes the schema's own contract
 ("every field in the schema is renderable by the renderer") an enforced property
 instead of a comment: an edit decision can no longer
 describe a picture the renderer will not produce.
 
+### Per-effect credit
+
+Credit is attributed to the decision that actually varied, in two forms:
+
+```bash
+# the attribution table for one group: what changed, why, and how much it weighed
+python bin/edit_apart_core.py attribute <dataset.jsonl> --group-id <gid>
+# the corpus-wide profile: what the rewards (and an identity) prefer, effect by effect
+python bin/edit_apart_core.py attribute <dataset.jsonl> [--identity ID] [--style S]
+```
+
+Three properties make the table trustworthy rather than plausible. Rows are keyed by
+**shot**, not by index — candidates of one group can select different numbers of shots,
+so index 6 of one candidate is a different shot from index 6 of another and an
+index-keyed diff invents changes (a real value against `None`) and blames them on an
+effect. The axis comes from the **logged knobs**, so a coupled decision counts once:
+transition type/duration/alignment are one decision (a duration is meaningless without
+the type) and they legitimately move together, where a slot count would misreport them
+as three decisions. And each row carries the **critic's own judgement** for that shot
+(`decision`/`why`/`reward_delta`, now logged on the reward record) beside the
+group-relative advantage, so a row states its basis and its magnitude.
+
+`attributable` is the flag to check before believing any of it: exactly one knob axis
+engaged AND the candidates selected the same shots. A group that varies several
+decisions, or that changed its **material** as well as its effects, has no
+single-decision credit to give — the profile counts and skips those groups rather than
+folding an unattributable number into a claim. That is why `--effect-grid` holds the
+selection fixed and varies only the effects; exploring both dimensions is two
+proposals, not one. (Nothing measured depended on the previous pairing, which was
+introduced and replaced inside this unreleased sequence.)
+
+One finding this makes visible: in an effect group the **objective critic's reward is
+flat** across transition values — it scores duration, motion and target, and cannot see
+a dissolve at all. So the effect columns of the profile discriminate only through the
+**identity** (the `taste_mean` column), which is precisely why an effect preference has
+to be learned from an external pick rather than from the rubric. The test
+`test_the_critic_cannot_see_a_transition` fails if that ever stops being true.
+
 **Not yet done, and worth naming:** credit is still per *candidate*, not per *effect* —
-the group-relative advantage is broadcast over the whole timeline rather than attributed
-to the effect that changed (the segment-local-credit design in
-[`docs/expansion-plan.md`](docs/expansion-plan.md)); the effect axes are a fixed grid
-rather than continuous optimisation; and effects carry no provenance of their own beyond
-the pick provenance described above.
+the group-relative advantage is still broadcast over the whole candidate rather than
+**graded into** the per-row table — the table records the attribution (which decision
+changed, on what basis, with what weight) but the gradient is not yet distributed over
+its rows, so a group that varies several decisions still trains one advantage for all of
+them (the segment-local-credit design in [`docs/expansion-plan.md`](docs/expansion-plan.md)).
+The effect axes are a fixed grid rather than continuous optimisation, and effects carry
+no provenance of their own beyond the pick provenance described above.
 
 ### The training datum (and why the raws are kept)
 
@@ -345,7 +388,7 @@ garbage-collection rule.
 | The repair is partial and content-driven | 4-arm transfer experiment (re-measured): only the 3-image/narrow-family arm transferred to an unseen image+geometry (tight/loose ratio **0.400**) while A1/A2/B2 showed no effect (1.000); on a *seen* image at the same geometry three of four arms did separate. The ±0.36 ordering-metric noise floor from the no-taste control is a pre-fix measurement |
 | The loop is numpy-optional | legacy `propose group=1` and group logging work with numpy blocked; only the model path errors |
 
-Reproduce with `tests/test_taste_model.py` (58 tests, no media needed) and
+Reproduce with `tests/test_taste_model.py` (74 tests, no media needed) and
 `tests/test_loop_e2e.py` (real footage; see **Verification**).
 
 ### Concurrent work (2026-09)
@@ -666,7 +709,7 @@ empty `style_file` no longer resolves to a directory.
 # the no-machine-local-paths rule (needs PyYAML; <1s)
 ~/dsh-edit-venv/bin/python tests/test_bundle_packaging.py -v
 
-# model + video loop unit suite: 58 tests, no media required (~25s)
+# model + video loop unit suite: 74 tests, no media required (~25s)
 ~/dsh-edit-venv/bin/python tests/test_taste_model.py -v
 
 # environment conformance: prove THIS install's renderer/prober can support the

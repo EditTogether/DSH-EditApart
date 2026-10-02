@@ -390,6 +390,22 @@ class TestTransitionRendering(unittest.TestCase):
             self.assertNotEqual(digest, cut_digest,
                                 f"{align}: the rendered file is identical to a hard cut")
 
+    def test_a_lut_changes_the_picture(self):
+        """`grade.lut` is rendered, so it must alter the pixels."""
+        import edit_apart_core as core
+        import hashlib
+        digests = {}
+        for name, lut in (("none", None), ("warm", "warm"), ("cool", "cool")):
+            schema = self._schema()
+            for segment in schema["structure"]:
+                segment["grade"]["lut"] = lut
+            out = os.path.join(self.tmp, f"lut_{name}.mp4")
+            core.cmd_render(self.src, schema, out)
+            with open(out, "rb") as fh:
+                digests[name] = hashlib.sha256(fh.read()).hexdigest()
+        self.assertNotEqual(digests["none"], digests["warm"])
+        self.assertNotEqual(digests["warm"], digests["cool"])
+
     def test_a_non_renderable_field_is_refused_at_render_time(self):
         import edit_apart_core as core
         schema = self._schema()

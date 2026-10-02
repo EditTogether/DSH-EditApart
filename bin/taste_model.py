@@ -400,7 +400,13 @@ def features_video_v2(schema: dict, inventory: dict, rubric: dict) -> dict:
             return default
 
     transitions = []
-    for seg in segs:
+    for i, seg in enumerate(segs):
+        # `transition` is the transition INTO a segment (documented in the schema
+        # contract), so segment 0 has no predecessor and carries none. Counting it
+        # anyway made `transition_frac` sum over n segments while the boundary count
+        # is n-1 — and it would have mis-scored the moment `xfade` was wired up.
+        if i == 0:
+            continue
         tr = seg.get("transition") or {}
         if tr.get("type") not in (None, "", "cut"):
             transitions.append(tr)

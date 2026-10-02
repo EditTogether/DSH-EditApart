@@ -357,9 +357,6 @@ export function apply(ctx) {
         if (identity && existsSync(identity)) argv.push('--identity', identity)
         if (process.env.DSH_EDITAPART_STYLE) argv.push('--style', process.env.DSH_EDITAPART_STYLE)
         if (args.select) argv.push('--select', String(args.select))
-        if (args.effect_grid) argv.push('--effect-grid')
-        if (args.refine) argv.push('--refine', String(args.refine))
-        if (args.feature_spec) argv.push('--feature-spec', String(args.feature_spec))
         if (args.no_log) argv.push('--no-log')
         return runCore(PHOTO_CORE, argv)
       },

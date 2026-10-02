@@ -374,6 +374,21 @@ def _sha256_file(path: str | None) -> str | None:
 # model over the v1 layout can only choose WHICH selection to use — it cannot set
 # how the inputs combine. These are the axes such an effect actually has, and
 # `_refine_effects` searches them with the identity's score.
+#: Transition types the RENDERER executes. A type outside this set may not be
+#: written into a schema by propose/refine and may not be rendered at all — see
+#: `assert_renderable`. (The v2 feature layout measures fields; a field the
+#: renderer does not execute must never carry a live value, or the logged "edit
+#: decision" would describe a picture that does not exist.)
+RENDERED_TRANSITION_TYPES = ("cut", "dissolve")
+
+#: Where the CUT sits inside a transition window, as a fraction of its duration
+#: A (the part of the window before the cut). `start` begins at the cut (so the
+#: outgoing shot is extended and the timeline does not shorten), `end` ends at the
+#: cut (the timeline shortens by the full duration), `center` is half either side.
+#: The renderer realises this with `xfade` + a `tpad` extension of the outgoing
+#: run, so all three are exact rather than approximated.
+CUT_IN_WINDOW = {"start": 0.0, "center": 0.5, "end": 1.0}
+
 TRANSITION_TYPES = ("cut", "dissolve")
 TRANSITION_ALIGNMENTS = ("center", "start", "end")
 TRANSITION_DURS = (0.0, 0.2, 0.4, 0.8, 1.2)
@@ -389,13 +404,17 @@ EFFECT_DEFAULTS = {"transition": "cut", "transition_dur": 0.0,
 #: preference, and `refine` would have nothing to apply. These entries are paired
 #: with the selection grid so one group spans both, which is what lets an external
 #: pick between two effect settings become a revealed preference.
+#: Only effects the RENDERER executes may appear here: a knob whose field the
+#: renderer ignores would train a preference with no observable consequence and log
+#: an edit decision the picture does not contain. `assert_renderable` enforces the
+#: same rule at the logging and rendering boundary.
 EFFECT_CANDIDATE_GRID = (
     {},                                                                    # rubric verbatim
     {"transition": "dissolve", "transition_dur": 0.4, "transition_align": "center"},
     {"transition": "dissolve", "transition_dur": 0.8, "transition_align": "center"},
     {"transition": "dissolve", "transition_dur": 0.8, "transition_align": "start"},
-    {"duck": 0.3},
-    {"duck": 0.6, "grade": 1.0},
+    {"transition": "dissolve", "transition_dur": 0.5, "transition_align": "end"},
+    {"grade": 1.0},
 )
 
 #: The axes swept by the refiner, in a FIXED order so a run is reproducible.
@@ -427,12 +446,38 @@ def apply_effects(schema: dict, knobs: dict) -> dict:
     align = str(knobs.get("transition_align", "center"))
     duck = float(knobs.get("duck", 0.0) or 0.0)
     grade = float(knobs.get("grade", 0.0) or 0.0)
-    for seg in schema.get("structure") or []:
-        if type_ == "cut" or dur <= 0.0:
+    structure = schema.get("structure") or []
+
+    def _effective(seg: dict, index: int) -> float:
+        trim = seg.get("trim") or {}
+        try:
+            span = float(trim.get("out", 0.0)) - float(trim.get("in", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+        retime = seg.get("retime")
+        try:
+            factor = float(retime) if retime else 1.0
+        except (TypeError, ValueError):
+            factor = 1.0
+        return span / (factor if factor > 0 else 1.0)
+
+    for i, seg in enumerate(structure):
+        # `transition` is the transition INTO this segment; segment 0 has no
+        # predecessor, so it carries none (it is a lead-in). It used to be written
+        # on every segment, which made the field's meaning ambiguous.
+        if i == 0 or type_ == "cut" or dur <= 0.0:
             seg["transition"] = {"type": "cut", "dur": 0.0, "params": {}}
         else:
-            seg["transition"] = {"type": type_, "dur": round(dur, 3),
-                                 "params": {"alignment": align}}
+            # A transition cannot be longer than either shot it joins: clamp here
+            # so the value WRITTEN into the schema is one the renderer can realise
+            # (the renderer clamps too, and reports it if it ever has to).
+            feasible = max(0.0, min(dur, _effective(structure[i - 1], i - 1),
+                                    _effective(seg, i)))
+            if feasible <= 0.0:
+                seg["transition"] = {"type": "cut", "dur": 0.0, "params": {}}
+            else:
+                seg["transition"] = {"type": type_, "dur": round(feasible, 3),
+                                     "params": {"alignment": align}}
         if duck:
             seg.setdefault("audio", {})["duck"] = round(duck, 4)
         if grade:
@@ -446,7 +491,7 @@ def knobs_from_schema(schema: dict) -> dict:
     """Recover the effect knobs a schema already carries (so a refinement starts
     from the candidate under test rather than from a hardcoded default)."""
     knobs = dict(EFFECT_DEFAULTS)
-    for seg in schema.get("structure") or []:
+    for seg in (schema.get("structure") or [])[1:]:      # segment 0 is a lead-in
         tr = seg.get("transition") or {}
         if tr.get("type") not in (None, "", "cut") and float(tr.get("dur") or 0.0) > 0:
             knobs["transition"] = str(tr["type"])
@@ -650,6 +695,7 @@ def cmd_propose(inventory: dict, rubric: dict, group: int = 1, identity: str | N
             effect_knobs = dict(EFFECT_CANDIDATE_GRID[i % len(EFFECT_CANDIDATE_GRID)])
             if effect_knobs:
                 apply_effects(schema, effect_knobs)
+        assert_renderable(schema)
         crit = _score_objective(schema, inventory, rubric, None)
         cands.append({
             "idx": i, "schema": schema, "critic": crit,
@@ -684,6 +730,7 @@ def cmd_propose(inventory: dict, rubric: dict, group: int = 1, identity: str | N
             refined = refine_effects(tm, cands[seed]["schema"], inventory, rubric,
                                      scorer, steps=refine, spec=spec)
             if refined["score"] is not None and refined["score"] > scores[seed] + 1e-12:
+                assert_renderable(refined["schema"])
                 feats.append(tm.features_for(spec, refined["schema"], inventory, rubric))
                 scores.append(refined["score"])
                 cands.append({
@@ -790,10 +837,119 @@ def _has_audio(src: str) -> bool:
     return bool(r.stdout.strip())
 
 
+#: Schema fields the renderer does NOT execute. Writing a non-default value into
+#: one of them used to be silently possible: the field reached the log and the
+#: feature vector while the renderer ignored it, so a taste identity could learn a
+#: preference with no observable consequence and the audit artifact would describe
+#: a picture that was never produced. Until each is implemented (`sidechaincompress`
+#: needs a music bed, `lut3d` needs a LUT file, an overlay needs overlay media, and
+#: `position` needs a canvas), they are declared-but-unrendered and REFUSED.
+UNRENDERED_FIELDS = {
+    "audio.duck": "no music bed is mixed, so there is nothing to duck under",
+    "grade.lut": "no LUT is shipped or referenced",
+    "overlay": "no overlay media is referenced",
+    "transform.position": "the output canvas is the source frame; there is nowhere to place a layer",
+}
+
+
+def assert_renderable(schema: dict) -> None:
+    """Refuse a schema the renderer cannot execute faithfully.
+
+    Called by `propose`/`refine` before anything is logged and by `render` before
+    anything is encoded, so the edit decision and the picture cannot disagree.
+    """
+    for i, seg in enumerate(schema.get("structure") or []):
+        tr = seg.get("transition") or {}
+        type_ = tr.get("type")
+        if type_ not in (None, "", *RENDERED_TRANSITION_TYPES):
+            raise RuntimeError(
+                f"structure[{i}].transition.type={type_!r} is not renderable "
+                f"(the renderer executes {', '.join(RENDERED_TRANSITION_TYPES)}); "
+                "an unrendered transition would be logged as an edit decision that "
+                "the picture does not contain")
+        if tr.get("params", {}).get("alignment") not in (None, "", *CUT_IN_WINDOW):
+            raise RuntimeError(
+                f"structure[{i}].transition.params.alignment="
+                f"{tr['params']['alignment']!r} is not renderable "
+                f"(known: {', '.join(CUT_IN_WINDOW)})")
+        if float((seg.get("audio") or {}).get("duck") or 0.0) != 0.0:
+            raise RuntimeError(
+                f"structure[{i}].audio.duck is declared but not rendered: "
+                f"{UNRENDERED_FIELDS['audio.duck']}")
+        if (seg.get("grade") or {}).get("lut"):
+            raise RuntimeError(
+                f"structure[{i}].grade.lut is declared but not rendered: "
+                f"{UNRENDERED_FIELDS['grade.lut']}")
+        if seg.get("overlay"):
+            raise RuntimeError(
+                f"structure[{i}].overlay is declared but not rendered: "
+                f"{UNRENDERED_FIELDS['overlay']}")
+        if (seg.get("transform") or {}).get("position"):
+            raise RuntimeError(
+                f"structure[{i}].transform.position is declared but not rendered: "
+                f"{UNRENDERED_FIELDS['transform.position']}")
+
+
+def transition_plan(segs: list[dict], seg_eff: list[float],
+                    fps: float | None = None) -> dict:
+    """Group segments into runs and compute the xfade geometry per transition.
+
+    A "run" is a maximal group of segments joined by hard cuts. Transitions happen
+    BETWEEN runs, which is what keeps the cut case byte-identical to the old
+    renderer (one run -> plain `concat`) instead of routing every edit through a
+    new code path.
+
+    For a transition whose duration is D with the cut at fraction A of its window:
+    the outgoing run is extended by B = D - A (its last frame is cloned, so no media
+    handles beyond the trim are required), the fade starts at `offset = acc - A`
+    (acc = the accumulated duration so far) and the output shortens by A. All three
+    alignments are therefore exact rather than approximated.
+    """
+    runs: list[list[int]] = [[0, 1]]
+    boundaries: list[int] = []
+    for i in range(1, len(segs)):
+        tr = segs[i].get("transition") or {}
+        type_ = tr.get("type")
+        if (type_ in RENDERED_TRANSITION_TYPES and type_ != "cut"
+                and float(tr.get("dur") or 0.0) > 0.0):
+            runs.append([i, i + 1])
+            boundaries.append(i)
+        else:
+            runs[-1][1] = i + 1
+    durations = [sum(seg_eff[a:b]) for a, b in runs]
+    def snap(value: float) -> float:
+        """Quantise to a whole frame. `xfade` snaps its offset itself, so an
+        unsnapped plan would make the rendered duration differ from the planned one
+        by up to a frame — and the log would then describe a render it does not
+        match. Snapping here means the geometry we report IS the geometry produced."""
+        if not fps or fps <= 0:
+            return value
+        return round(value * fps) / fps
+
+    plan: list[dict] = []
+    acc = durations[0] if durations else 0.0
+    for step, into in enumerate(boundaries, start=1):
+        tr = segs[into]["transition"]
+        align = str((tr.get("params") or {}).get("alignment") or "center")
+        requested = float(tr.get("dur") or 0.0)
+        cut_frac = CUT_IN_WINDOW.get(align, 0.5)
+        duration = snap(min(requested, durations[step], max(0.0, acc - 0.02)))
+        a_part = snap(min(cut_frac * duration, acc))
+        b_part = max(0.0, duration - a_part)
+        plan.append({"run": step, "into": into, "requested": requested,
+                     "duration": duration, "a": a_part, "b": b_part,
+                     "offset": max(0.0, acc - a_part),
+                     "clamped": abs(duration - requested) > 1e-6,
+                     "alignment": align})
+        acc = acc + b_part + durations[step] - duration
+    return {"runs": [tuple(r) for r in runs], "plan": plan, "durations": durations}
+
+
 def cmd_render(src: str, schema: dict, out: str) -> dict:
     segs = schema.get("structure", [])
     if not segs:
         raise RuntimeError("schema has no structure segments")
+    assert_renderable(schema)
     # A segment may come from the SOURCE footage (default) or from an
     # AI-GENERATED clip (the store/harness generation tool produced an asset).
     # Build the input list: input 0 = source, then one per distinct generated
@@ -815,9 +971,13 @@ def cmd_render(src: str, schema: dict, out: str) -> dict:
     v_filter: list[str] = []
     in_labels: list[str] = []
     used_inputs: set[int] = set()
+    seg_parts: list[list[str]] = []
+    seg_src: list[int] = []
+    seg_eff: list[float] = []
     for i, seg in enumerate(segs):
         s = src_index(seg)
         used_inputs.add(s)
+        seg_src.append(s)
         trim = seg.get("trim") or {}
         if "in" not in trim or "out" not in trim:
             raise RuntimeError(f"segment {i} has no trim {{in,out}} — the renderer needs both")
@@ -828,7 +988,11 @@ def cmd_render(src: str, schema: dict, out: str) -> dict:
         parts = ["trim=" + f"start={t_in:g}:end={t_out:g}", "setpts=PTS-STARTPTS"]
         retime = seg.get("retime", 0.0)
         if retime not in (0.0, None):
-            parts.append(f"setpts=PTS/{_num(retime, f'structure[{i}].retime', 0.01, 100.0):g}")
+            retime_v = _num(retime, f"structure[{i}].retime", 0.01, 100.0)
+            parts.append(f"setpts=PTS/{retime_v:g}")
+        else:
+            retime_v = 1.0
+        seg_eff.append((t_out - t_in) / retime_v)
         tf = seg.get("transform") or {}
         scale = _num(tf.get("scale", 1.0), f"structure[{i}].transform.scale", 0.01, 20.0)
         if scale != 1.0:
@@ -842,9 +1006,52 @@ def cmd_render(src: str, schema: dict, out: str) -> dict:
                   for k in ("brightness", "contrast", "saturation", "gamma") if k in eq]
         if eqopts:
             parts.append("eq=" + ":".join(eqopts))
+        seg_parts.append(parts)
         v_filter.append(f"[{s}:v]" + ",".join(parts) + f",format=yuv420p[v{i}]")
         in_labels.append(f"[v{i}]")
     concat_v = "".join(in_labels) + f"concat=n={len(segs)}:v=1:a=0[outv]"
+
+    # ── video chain: plain concat for an all-cut edit, xfade when a transition
+    # is present. The cut path stays exactly as it was so every measurement taken
+    # with it (and its exact output) remains comparable.
+    probe = _probe(inputs[0])
+    try:
+        fps_num, fps_den = (str(probe.get("r_frame_rate") or "")).split("/")
+        fps_value = float(fps_num) / float(fps_den or 1)
+    except (ValueError, ZeroDivisionError):
+        fps_value = None
+    tl_plan = transition_plan(segs, seg_eff, fps_value)
+    runs, plan = tl_plan["runs"], tl_plan["plan"]
+    transition_path = len(runs) > 1
+    if not transition_path:
+        v_chain = v_filter + [concat_v]
+    else:
+        width, height = int(probe.get("width") or 0), int(probe.get("height") or 0)
+        fps = str(probe.get("r_frame_rate") or "")
+        if not (width and height and fps):
+            raise RuntimeError(
+                "transitions need a common canvas, but width/height/fps could not be "
+                f"read from {inputs[0]!r}; render without transitions or re-encode the source")
+        norm = [f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2", "setsar=1", f"fps={fps}"]
+        v_chain = [f"[{seg_src[i]}:v]" + ",".join(seg_parts[i] + norm)
+                   + f",format=yuv420p[v{i}]" for i in range(len(segs))]
+        for k, (a, b) in enumerate(runs):
+            labels = "".join(f"[v{i}]" for i in range(a, b))
+            v_chain.append(labels + (f"null[rv{k}]" if b - a == 1 else
+                                     f"concat=n={b - a}:v=1:a=0[rv{k}]"))
+        current = "[rv0]"
+        for step in plan:
+            k = step["run"]
+            if step["b"] > 0:
+                v_chain.append(f"{current}tpad=stop_mode=clone:stop_duration="
+                               f"{step['b']:.6g}[pv{k}]")
+            else:
+                v_chain.append(f"{current}null[pv{k}]")
+            v_chain.append(f"[pv{k}][rv{k}]xfade=transition=fade:duration="
+                           f"{step['duration']:.6g}:offset={step['offset']:.6g}[xv{k}]")
+            current = f"[xv{k}]"
+        v_chain.append(f"{current}null[outv]")
 
     # Audio presence must be probed AFTER generated assets are registered above,
     # and only for the inputs the segments actually reference.
@@ -877,20 +1084,40 @@ def cmd_render(src: str, schema: dict, out: str) -> dict:
             a += f"[a{i}]"
             a_filter.append(a)
             a_labels.append(f"[a{i}]")
-        a_chain = "".join(a_labels) + f"concat=n={len(a_labels)}:v=0:a=1,loudnorm[aout]"
+        if not transition_path:
+            a_chain_lines = a_filter + [
+                "".join(a_labels) + f"concat=n={len(a_labels)}:v=0:a=1,loudnorm[aout]"]
+        else:
+            # The audio must shorten by exactly the same A per transition as the
+            # video, or the picture and the sound drift apart at every dissolve.
+            lines = []
+            for k, (a_start, a_end) in enumerate(runs):
+                labels = "".join(f"[a{i}]" for i in range(a_start, a_end))
+                lines.append(labels + (f"anull[ra{k}]" if a_end - a_start == 1 else
+                                       f"concat=n={a_end - a_start}:v=0:a=1[ra{k}]"))
+            current = "[ra0]"
+            for step in plan:
+                k = step["run"]
+                if step["b"] > 0:
+                    lines.append(f"{current}apad=pad_dur={step['b']:.6g}[pa{k}]")
+                else:
+                    lines.append(f"{current}anull[pa{k}]")
+                lines.append(f"[pa{k}][ra{k}]acrossfade=d={step['duration']:.6g}"
+                             f":c1=tri:c2=tri[xa{k}]")
+                current = f"[xa{k}]"
+            lines.append(f"{current}loudnorm[aout]")
+            a_chain_lines = a_filter + lines
     else:
-        # NO input carries audio at all. Emit one silent track of the total length
-        # and deliberately skip loudnorm: single-pass loudnorm on digital silence
-        # divides by zero energy and hands the AAC encoder NaN, which failed the
-        # render with "Input contains (near) NaN/+-Inf".
-        total = 0.0
-        for i, seg in enumerate(segs):
-            trim = seg.get("trim") or {}
-            total += (_num(trim["out"], f"structure[{i}].trim.out", 0.0, 10 ** 6)
-                      - _num(trim["in"], f"structure[{i}].trim.in", 0.0, 10 ** 6))
-        a_chain = (f"anullsrc=channel_layout=stereo:sample_rate=48000,"
-                   f"atrim=start=0:end={max(0.05, total):g},asetpts=PTS-STARTPTS[aout]")
-    fc = ";".join(v_filter + [concat_v]) + ";" + ";".join(a_filter + [a_chain])
+        # NO input carries audio at all. Emit one silent track covering the RENDERED
+        # timeline (transitions shorten it), and deliberately skip loudnorm:
+        # single-pass loudnorm on digital silence divides by zero energy and hands
+        # the AAC encoder NaN, which failed the render with
+        # "Input contains (near) NaN/+-Inf".
+        total = sum(seg_eff) - sum(step["a"] for step in plan)
+        a_chain_lines = [
+            f"anullsrc=channel_layout=stereo:sample_rate=48000,"
+            f"atrim=start=0:end={max(0.05, total):g},asetpts=PTS-STARTPTS[aout]"]
+    fc = ";".join(v_chain) + ";" + ";".join(a_chain_lines)
 
     input_args: list[str] = []
     for inp in inputs:
@@ -903,7 +1130,15 @@ def cmd_render(src: str, schema: dict, out: str) -> dict:
         # The BANNER is the first ~400 chars; the actual error is the last line.
         tail = "\n".join((r.stderr or "").strip().splitlines()[-3:]) or "(no stderr)"
         raise RuntimeError(f"ffmpeg render failed: {tail}")
-    return {"out": out, "duration": _probe(out).get("duration")}
+    rendered = {"out": out, "duration": _probe(out).get("duration")}
+    if transition_path:
+        # Report the geometry that was actually produced, so a caller (and the log)
+        # can see that the planned and rendered transitions agree.
+        rendered["transitions"] = [
+            {k: step[k] for k in ("into", "alignment", "requested", "duration", "a", "b",
+                                  "offset", "clamped")}
+            for step in plan]
+    return rendered
 
 
 # --------------------------------------------------------------------------

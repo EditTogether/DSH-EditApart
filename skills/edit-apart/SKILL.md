@@ -299,6 +299,14 @@ fine-tuned language model.
   step (this is what `propose_schema group=K` + `train_identity` do for real).
   Interleave **self-play** (the deterministic candidate grid) with **history**
   (the creator's logged prior edits).
+- **Only renderable fields exist.** `transition` (cut/dissolve) is rendered —
+  `xfade`/`acrossfade` with frame-exact geometry, and `alignment` chooses where the cut
+  sits in the window (`start` extends the outgoing shot, `end` shortens the timeline by
+  the full duration, `center` splits it). `audio.duck`, `grade.lut`, `overlay[]` and
+  `transform.position` are declared but NOT rendered: writing a value into them is
+  refused with a reason, because a logged decision that the picture does not contain is
+  worse than a missing feature. Do not invent fields either — the schema contract is
+  "every field is renderable", and it is enforced.
 - **Effects are decisions too.** Log groups with `feature_spec=video/v2` when the
   edit has multi-input effects worth learning (transitions, ducking, grading,
   overlays): the v1 layout cannot see any of them, so a v1-logged group can never

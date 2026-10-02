@@ -486,7 +486,10 @@ class TestEffectTaste(unittest.TestCase):
             scorer = tm.TasteScorer.load(identity)
         result = core.refine_effects(tm, self._schema(0.0), {}, {}, scorer, steps=6)
         durations = [float(seg["transition"]["dur"]) for seg in result["schema"]["structure"]]
-        self.assertTrue(all(d > 0 for d in durations),
+        # `transition` is the transition INTO a segment, so segment 0 is a lead-in
+        # and must carry none; the others must carry the chosen dissolve.
+        self.assertEqual(durations[0], 0.0, "the lead-in must not carry a transition")
+        self.assertTrue(all(d > 0 for d in durations[1:]),
                         f"the identity did not choose a transition at all: {durations}")
         self.assertGreater(max(durations), 0.8,
                            f"the identity did not push the duration up: {durations}")
@@ -541,7 +544,9 @@ class TestEffectGrid(unittest.TestCase):
                                     dataset=effect, clip_id="c2", effect_grid=True)
             self.assertEqual(out2["group"]["feature_spec"], tm.FEATURE_SPEC_VIDEO_V2)
             plain_cands, effect_cands = self._candidates(plain), self._candidates(effect)
-        for name in ("transition_dur_mean", "duck_depth_mean", "grade_dev_mean"):
+        # Only fields the RENDERER executes may appear in the grid: duck, LUT,
+        # overlay and position are declared-but-unrendered and must stay constant.
+        for name in ("transition_dur_mean", "transition_frac", "grade_dev_mean"):
             legacy = {round(c["features"].get(name, 0.0), 6) for c in plain_cands}
             spanned = {round(c["features"].get(name, 0.0), 6) for c in effect_cands}
             self.assertEqual(len(legacy), 1,
@@ -550,6 +555,99 @@ class TestEffectGrid(unittest.TestCase):
                                f"the effect grid must span {name} or nothing is learnable")
         self.assertTrue(any(c["knobs"].get("transition_dur") for c in effect_cands),
                         "no candidate carries an effect knob")
+        for unrendered in ("duck_depth_mean", "lut_frac", "overlay_frac"):
+            self.assertEqual({round(c["features"].get(unrendered, 0.0), 6)
+                              for c in effect_cands}, {0.0},
+                             f"{unrendered} is measured but not rendered — it must stay 0")
+
+
+class TestRenderedEffectContract(unittest.TestCase):
+    """A schema field the renderer does not execute may never carry a live value.
+
+    The v2 layout measures `duck_depth_mean`, `lut_frac`, `overlay_frac` and part of
+    `reframe_frac`; until those are rendered (sidechaincompress needs a music bed,
+    lut3d a LUT file, an overlay an overlay source, position a canvas), writing them
+    would train a preference with no observable consequence and log an edit decision
+    the picture does not contain. `assert_renderable` refuses them, and the effect
+    grid may not span them.
+    """
+
+    def _schema(self, **over):
+        seg = {"trim": {"in": 0.0, "out": 2.0}, "retime": 0.0,
+               "timeline": {"in": 0.0, "out": 2.0},
+               "transition": {"type": "cut", "dur": 0.0, "params": {}},
+               "transform": {"scale": 1.0, "crop": None, "position": None},
+               "grade": {"lut": None, "eq": {}},
+               "audio": {"level": 1.0, "duck": 0.0, "fade": 0.0}, "overlay": []}
+        seg.update(over)
+        return {"structure": [dict(seg), dict(seg)]}
+
+    def test_unrendered_fields_are_refused(self):
+        import edit_apart_core as core
+        for over in ({"audio": {"level": 1.0, "duck": 0.6, "fade": 0.0}},
+                     {"grade": {"lut": "warm.lut", "eq": {}}},
+                     {"overlay": [{"kind": "text", "text": "hi"}]},
+                     {"transform": {"scale": 1.0, "crop": None, "position": {"x": 0.1}}}):
+            with self.assertRaises(RuntimeError, msg=f"{over} must be refused"):
+                core.assert_renderable(self._schema(**over))
+
+    def test_rendered_fields_pass_the_gate(self):
+        import edit_apart_core as core
+        core.assert_renderable(self._schema(
+            transition={"type": "dissolve", "dur": 0.8, "params": {"alignment": "center"}},
+            grade={"lut": None, "eq": {"saturation": 1.2}}))
+
+    def test_an_unknown_transition_type_is_refused(self):
+        import edit_apart_core as core
+        with self.assertRaises(RuntimeError):
+            core.assert_renderable(self._schema(
+                transition={"type": "whip_pan", "dur": 0.4, "params": {}}))
+
+    def test_apply_effects_leaves_the_lead_in_alone(self):
+        """`transition` is the transition INTO a segment; segment 0 has none."""
+        import edit_apart_core as core
+        schema = self._schema()
+        core.apply_effects(schema, {"transition": "dissolve", "transition_dur": 0.5})
+        self.assertEqual(schema["structure"][0]["transition"]["type"], "cut")
+        self.assertEqual(schema["structure"][1]["transition"]["type"], "dissolve")
+
+    def test_a_transition_longer_than_its_shot_is_clamped_when_written(self):
+        """The value WRITTEN must be one the renderer can realise."""
+        import edit_apart_core as core
+        base = self._schema()
+        short = {"structure": [
+            {**base["structure"][0], "trim": {"in": 0.0, "out": 0.4},
+             "timeline": {"in": 0.0, "out": 0.4}},
+            {**base["structure"][1], "trim": {"in": 0.0, "out": 0.4},
+             "timeline": {"in": 0.0, "out": 0.4}}]}
+        core.apply_effects(short, {"transition": "dissolve", "transition_dur": 1.2})
+        self.assertLessEqual(float(short["structure"][1]["transition"]["dur"]), 0.4)
+
+    def test_plan_groups_cuts_into_one_run_and_transitions_into_several(self):
+        import edit_apart_core as core
+        cut = core.transition_plan(self._schema()["structure"], [2.0, 2.0])
+        self.assertEqual(len(cut["runs"]), 1,
+                         "an all-cut edit must stay one run (plain concat, unchanged path)")
+        self.assertEqual(cut["plan"], [])
+        mixed = self._schema(
+            transition={"type": "dissolve", "dur": 1.0, "params": {"alignment": "center"}})
+        plan = core.transition_plan(mixed["structure"], [2.0, 2.0], fps=25.0)
+        self.assertEqual(len(plan["runs"]), 2)
+        step = plan["plan"][0]
+        # frame-exact: 0.5 s is 12.5 frames at 25 fps, snapped to 12 (0.48 s), and the
+        # rendered duration is sum(durations) - a
+        self.assertAlmostEqual(step["a"], 0.48, places=9)
+        self.assertAlmostEqual(step["b"], 0.52, places=9)
+        self.assertAlmostEqual(step["offset"], 2.0 - step["a"], places=9)
+        self.assertFalse(step["clamped"])
+
+    def test_lead_in_is_not_counted_as_a_transition(self):
+        """`transition_frac` must not exceed 1: it counts boundaries, not segments."""
+        schema = self._schema(
+            transition={"type": "dissolve", "dur": 0.4, "params": {"alignment": "center"}})
+        feats = tm.features_for(tm.FEATURE_SPEC_VIDEO_V2, schema, {}, {})
+        self.assertLessEqual(feats["transition_frac"], 1.0)
+        self.assertAlmostEqual(feats["transition_frac"], 1.0, places=9)
 
 
 class TestLogReplay(unittest.TestCase):

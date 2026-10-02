@@ -368,6 +368,11 @@ sequence is the methodological finding.
 | 5 | A render hard-required audio on every input; `loudnorm` on digital silence emits NaN | Muted screen recordings / GIF-sourced clips could not be rendered at all | Per-input audio probing + `anullsrc`; skip `loudnorm` when no input has audio |
 | 6 | `"reward_obj": null` aborted the whole training log | `taste_status`/`train` failed on any log containing an unscored group | None-safe folding; unscored candidates are skipped and counted |
 | 7 | The video E2E critiqued the selected schema while labelling the reward with `--candidate <pick>` | The logged reward for a revealed pick was the wrong candidate's | Candidate schemas exposed in the group metadata; the test asserts reward identity |
+| 8 | **The v2 effect features described a renderer that did not exist** (second review) | An identity could learn to prefer a dissolve while the render stayed a hard cut, and the logged decision named fields the picture did not contain — taste with no observable consequence | Transitions rendered (`xfade`/`acrossfade`, frame-exact; the all-cut path stays byte-identical, so no measurement had to be re-earned); `assert_renderable` refuses the five fields the renderer still cannot execute (`duck`, `lut`, `overlay`, `position`, unknown transition types), and the effect grid may only span rendered fields |
+
+Entry 8 required **no re-measurement**: the transition work leaves the all-cut render
+byte-identical (verified by hashing the rendered file before and after), which is the
+only reason every number above survives it.
 
 Findings 1, 4c and 4d were re-measured after entry 3, since all three were
 computed on the code path that entry fixed. Finding 2's ablation (0/12 → 12/12)

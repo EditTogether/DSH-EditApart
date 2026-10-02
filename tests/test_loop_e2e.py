@@ -36,6 +36,7 @@ Run:  DSH_EDITAPART_E2E_SRC=/path/to/footage.mp4 <venv>/bin/python tests/test_lo
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -181,8 +182,12 @@ class TestLoopE2E(unittest.TestCase):
                 g = out["group"]
                 self.assertEqual(g["select_by"], "taste")
                 scores = [c["taste_score"] for c in g["candidates"]]
-                self.assertEqual(g["selected"], max(range(len(scores)), key=lambda i: scores[i]),
-                                 "the selection is not the taste argmax")
+                # `taste_score` is emitted ROUNDED to 6 dp while the engine selects on
+                # raw floats, so a sub-5e-7 gap (common when a synthetic fixture gives
+                # near-identical candidate vectors) can flip the argmax over the emitted
+                # values. Accept any candidate within one rounding unit of the best.
+                self.assertLessEqual(max(scores) - scores[g["selected"]], 1e-6,
+                                     "the selection is not a taste argmax beyond tie tolerance")
                 picks[name].append(g["candidates"][g["selected"]]["duration"])
             # determinism: same brief + same identity ⇒ same pick
             again = engine("propose", json.dumps(self.inv), json.dumps(rub),
@@ -310,6 +315,87 @@ class TestVideoRenderRobustness(unittest.TestCase):
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
         self.assertIn("transform.scale", json.loads(r.stdout)["error"])
+
+
+class TestTransitionRendering(unittest.TestCase):
+    """A transition must be RENDERED, not merely logged.
+
+    The v2 layout measures the transition fields, so a transition the renderer
+    ignored would let an identity learn a preference with no observable consequence
+    and log an edit decision the picture does not contain. These tests render real
+    files and check that the picture changes and that the duration equals the plan's
+    (frame-exact), so the logged geometry and the produced picture agree.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("ffmpeg") is None:
+            raise unittest.SkipTest("ffmpeg not available")
+        cls.tmp = tempfile.mkdtemp(prefix="transitions_")
+        cls.src = os.path.join(cls.tmp, "src.mp4")
+        r = subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                            "testsrc=size=320x240:rate=25", "-t", "4",
+                            "-pix_fmt", "yuv420p", cls.src], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise unittest.SkipTest(f"could not synthesize a clip: {r.stderr[:200]}")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _schema(kind="cut", dur=0.0, align="center"):
+        def seg(shot, a, b):
+            return {"shot": shot, "trim": {"in": a, "out": b}, "retime": 0.0,
+                    "timeline": {"in": 0.0, "out": b - a},
+                    "transition": ({"type": kind, "dur": dur,
+                                    "params": {"alignment": align}}
+                                   if (kind != "cut" and shot == "b") else
+                                   {"type": "cut", "dur": 0.0, "params": {}}),
+                    "transform": {"scale": 1.0, "crop": None, "position": None},
+                    "grade": {"lut": None, "eq": {}},
+                    "audio": {"level": 1.0, "duck": 0.0, "fade": 0.0}, "overlay": []}
+        return {"structure": [seg("a", 0.0, 2.0), seg("b", 2.0, 4.0)],
+                "globals": {"music": {"bed": None}}}
+
+    def _render(self, name):
+        import edit_apart_core as core
+        out = os.path.join(self.tmp, f"{name}.mp4")
+        result = core.cmd_render(self.src, self._schema(**({} if name == "cut" else
+                                                          {"kind": "dissolve", "dur": 1.0,
+                                                           "align": name})), out)
+        with open(out, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+        return result, digest
+
+    def test_an_all_cut_edit_takes_the_unchanged_path(self):
+        result, _ = self._render("cut")
+        self.assertAlmostEqual(float(result["duration"]), 4.0, places=6)
+        self.assertNotIn("transitions", result,
+                         "an all-cut edit must not route through the transition path")
+
+    def test_transitions_change_the_picture_and_match_the_plan(self):
+        _, cut_digest = self._render("cut")
+        for align, expected_a in (("center", 0.48), ("end", 1.0), ("start", 0.0)):
+            result, digest = self._render(align)
+            step = result["transitions"][0]
+            self.assertEqual(step["alignment"], align)
+            self.assertAlmostEqual(step["a"], expected_a, places=9,
+                                   msg=f"{align}: frame-exact A at 25 fps")
+            # the RENDERED duration equals the planned one, so the logged geometry
+            # describes the picture that was produced
+            self.assertAlmostEqual(float(result["duration"]),
+                                   4.0 - step["a"], places=6,
+                                   msg=f"{align}: rendered duration disagrees with the plan")
+            self.assertNotEqual(digest, cut_digest,
+                                f"{align}: the rendered file is identical to a hard cut")
+
+    def test_a_non_renderable_field_is_refused_at_render_time(self):
+        import edit_apart_core as core
+        schema = self._schema()
+        schema["structure"][0]["audio"]["duck"] = 0.6
+        with self.assertRaises(RuntimeError):
+            core.cmd_render(self.src, schema, os.path.join(self.tmp, "refused.mp4"))
 
 
 if __name__ == "__main__":

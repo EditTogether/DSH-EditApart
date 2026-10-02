@@ -262,6 +262,20 @@ duration past 0.8 s from an all-cuts seed. The control run with no identity chan
 nothing. `TestEffectFeatures` pins the blindness of v1, the superset relation and the
 mixed-spec rule.
 
+**They are now rendered, and the rest are refused.** `cmd_render` executes transitions
+— `xfade` between runs, `acrossfade` for the audio, and an outgoing `tpad` extension so
+all three alignments are exact — which is what makes the transition features true: the
+rendered duration equals the planned one to the frame, and the picture at the boundary
+differs from a hard cut. The all-cut path is **byte-identical** to the renderer that
+produced every earlier measurement, so nothing had to be re-measured. The fields the
+renderer still does *not* execute — `audio.duck` (no music bed is mixed), `grade.lut`
+(no LUT), `overlay` (no overlay media), `transform.position` (the output canvas is the
+source frame) — are **declared-but-unrendered** and refused by `assert_renderable` at
+propose, refine and render time, with a reason. That makes the schema's own contract
+("every field in the schema is renderable by the renderer") an enforced property
+instead of a comment: an edit decision can no longer
+describe a picture the renderer will not produce.
+
 **Not yet done, and worth naming:** credit is still per *candidate*, not per *effect* —
 the group-relative advantage is broadcast over the whole timeline rather than attributed
 to the effect that changed (the segment-local-credit design in
@@ -615,6 +629,16 @@ here, and the behavioural numbers this README reports were re-measured afterward
    schemas are now exposed in the group metadata — which is also what the skill's
    "render a different candidate than the selected one" workflow requires — and the
    test asserts the logged reward is the picked candidate's.
+
+8. **The effect features described a renderer that did not exist** (found by a second
+   external review). `video/v2` measures transition, duck, LUT, overlay and position
+   fields while `cmd_render` only ever emitted `concat`: an identity could train for 300
+   epochs to prefer a dissolve and the rendered file was still a hard cut, and the logged
+   decision said `dissolve 0.8` while the picture disagreed — precisely the failure the
+   "auditable decision object" claim exists to prevent, on the newest fields. Fixed by
+   rendering transitions (`xfade`/`acrossfade`, frame-exact, cut path byte-identical) and
+   by **refusing** the fields the renderer still cannot execute (`assert_renderable`, at
+   propose, refine and render), with an effect grid that may only span rendered fields.
 
 **Packaging correction (harness 0.1.7).** The previous version of this README
 told users to clone the repository into `$DSH_HOME/.agent-presets/<id>/`. That

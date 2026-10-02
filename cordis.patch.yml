@@ -142,18 +142,15 @@
 
           # ── EditApart plugin ────────────────────────────────────────────────────────
 
-          # The editor's own plugin, mounted by RELATIVE path so it TRAVELS with the
-          # preset. It is import-free on purpose (a user-preset relative-mounted module
-          # cannot import @deepseek-ai/* — its internal imports resolve against the
-          # preset dir, not the harness), so it hand-builds ToolDefinitions and registers
-          # them via ctx.tools.register(), shelling out to bin/edit_apart_core.py
-          # (video) and bin/photo_core.py (photo) for the work. It registers ALL of the
-          # editing surface: 7 video tools + 5 photo tools, plus a guarded model-routing
-          # hook (opt-in via DSH_AI_VIDEO_MODEL_ROUTE=1 and a registered video-capable
-          # provider/model; inert by default so the session uses the default model).
-          # The leading `./` is required: `name` is the module specifier, and a relative
-          # name resolves against the preset's own directory; a bare name would be
-          # treated as a package and fail to import.
+          # The editor's own plugin. It is import-free on purpose: a preset row's
+          # specifier resolves against the PROFILE directory, where the harness's own
+          # @deepseek-ai/* packages are not resolvable, so it hand-builds ToolDefinitions
+          # and registers them via ctx.tools.register(), shelling out to
+          # bin/edit_apart_core.py (video) and bin/photo_core.py (photo) for the work.
+          # It registers ALL of the editing surface: 7 video tools + 5 photo tools, plus
+          # a guarded model-routing hook (opt-in via DSH_AI_VIDEO_MODEL_ROUTE=1 and a
+          # registered video-capable provider/model; inert by default so the session uses
+          # the default model).
           #
           # Model-authored video stays opt-in architecture, NOT a preset claim: fully
           # AI-generated clips come from a SEPARATE store plugin (or the harness
